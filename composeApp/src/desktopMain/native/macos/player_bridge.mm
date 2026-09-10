@@ -2101,13 +2101,16 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                               value:[resolvedBackgroundColor hasPrefix:@"#00"] ? @"outline-and-shadow" : @"opaque-box"];
         }
         if (modeChanged || outlineColorChanged) {
-            [self setStringProperty:"sub-outline-color" value:resolvedOutlineColor];
+            // The bundled mpv exposes the outline only as --sub-border-color;
+            // --sub-outline-color fails silently here.
+            [self setStringProperty:"sub-border-color" value:resolvedOutlineColor];
         }
         if (modeChanged || boldChanged) {
             [self setStringProperty:"sub-bold" value:bold ? @"yes" : @"no"];
         }
         if (modeChanged || outlineSizeChanged) {
-            mpv_set_property(_mpv, "sub-outline-size", MPV_FORMAT_DOUBLE, &outline);
+            // Outline size uses the same --sub-border-* naming as the color.
+            mpv_set_property(_mpv, "sub-border-size", MPV_FORMAT_DOUBLE, &outline);
         }
     }
     if (stripSdhChanged) {

@@ -1220,7 +1220,9 @@ public:
                 );
             }
             if (modeChanged || outlineColorChanged) {
-                setStringProperty("sub-outline-color", resolvedOutlineColor);
+                // --sub-border-color works on every mpv revision, unlike the
+                // --sub-outline-color name used by newer builds.
+                setStringProperty("sub-border-color", resolvedOutlineColor);
             }
             if (modeChanged || boldChanged) {
                 setStringProperty("sub-bold", bold ? "yes" : "no");
@@ -1228,7 +1230,7 @@ public:
             if (modeChanged || outlineSizeChanged) {
                 std::lock_guard<std::mutex> lock(mpvMutex);
                 if (!mpv) return;
-                mpvApi().setProperty(mpv, "sub-outline-size", MPV_FORMAT_DOUBLE, &outline);
+                mpvApi().setProperty(mpv, "sub-border-size", MPV_FORMAT_DOUBLE, &outline);
             }
         }
         if (stripSdhChanged) {
