@@ -293,8 +293,10 @@ internal fun settingsSearchEntries(
         category = aboutCategory,
         icon = Icons.Rounded.Info,
     )
+    val appLicense = appLicenseItem()
+    val playbackLicense = platformLicenseItem()
     listOf(
-        PlaybackSearchRow("nuvio-license", stringResource(Res.string.settings_licenses_attributions_nuvio_title), stringResource(Res.string.settings_licenses_attributions_nuvio_license)),
+        PlaybackSearchRow("nuvio-license", stringResource(appLicense.titleRes), stringResource(appLicense.licenseRes)),
         PlaybackSearchRow("tmdb-attribution", stringResource(Res.string.settings_licenses_attributions_tmdb_title), stringResource(Res.string.settings_licenses_attributions_tmdb_body)),
         PlaybackSearchRow("trakt-attribution", stringResource(Res.string.settings_licenses_attributions_trakt_title), stringResource(Res.string.settings_licenses_attributions_trakt_body)),
         PlaybackSearchRow("simkl-attribution", stringResource(Res.string.settings_licenses_attributions_simkl_title), stringResource(Res.string.settings_licenses_attributions_simkl_body)),
@@ -304,17 +306,9 @@ internal fun settingsSearchEntries(
         PlaybackSearchRow("introdb-attribution", stringResource(Res.string.settings_licenses_attributions_introdb_title), stringResource(Res.string.settings_licenses_attributions_introdb_body)),
         PlaybackSearchRow("imdb-datasets", stringResource(Res.string.settings_licenses_attributions_imdb_title), stringResource(Res.string.settings_licenses_attributions_imdb_body)),
         PlaybackSearchRow(
-            if (isIos) "mpvkit-license" else "exoplayer-license",
-            if (isIos) {
-                stringResource(Res.string.settings_licenses_attributions_mpvkit_title)
-            } else {
-                stringResource(Res.string.settings_licenses_attributions_exoplayer_title)
-            },
-            if (isIos) {
-                stringResource(Res.string.settings_licenses_attributions_mpvkit_license)
-            } else {
-                stringResource(Res.string.settings_licenses_attributions_exoplayer_license)
-            },
+            "player-license",
+            stringResource(playbackLicense.titleRes),
+            stringResource(playbackLicense.licenseRes),
         ),
     ).forEach { row ->
         addRow(
@@ -675,21 +669,25 @@ internal fun settingsSearchEntries(
             pageLabel = playbackPage,
             section = playbackDecoder,
             icon = Icons.Rounded.PlayArrow,
-            rows = listOf(
-                PlaybackSearchRow("decoder-priority", stringResource(Res.string.settings_playback_decoder_priority)),
-                PlaybackSearchRow("dv7-hevc", stringResource(Res.string.settings_playback_map_dv7_to_hevc), stringResource(Res.string.settings_playback_map_dv7_to_hevc_description)),
-                PlaybackSearchRow("tunneled-playback", stringResource(Res.string.settings_playback_tunneled_playback), stringResource(Res.string.settings_playback_tunneled_playback_description)),
-            ),
+            rows = buildList {
+                add(PlaybackSearchRow("decoder-priority", stringResource(Res.string.settings_playback_decoder_priority)))
+                if (!isDesktop) {
+                    add(PlaybackSearchRow("dv7-hevc", stringResource(Res.string.settings_playback_map_dv7_to_hevc), stringResource(Res.string.settings_playback_map_dv7_to_hevc_description)))
+                    add(PlaybackSearchRow("tunneled-playback", stringResource(Res.string.settings_playback_tunneled_playback), stringResource(Res.string.settings_playback_tunneled_playback_description)))
+                }
+            },
         )
         addPlaybackRows(
             addRow = ::addRow,
             pageLabel = playbackPage,
             section = playbackSubtitleRendering,
             icon = Icons.Rounded.PlayArrow,
-            rows = listOf(
-                PlaybackSearchRow("libass", stringResource(Res.string.settings_playback_enable_libass), stringResource(Res.string.settings_playback_enable_libass_description)),
-                PlaybackSearchRow("libass-render", stringResource(Res.string.settings_playback_render_type)),
-            ),
+            rows = buildList {
+                add(PlaybackSearchRow("libass", stringResource(Res.string.settings_playback_enable_libass), stringResource(Res.string.settings_playback_enable_libass_description)))
+                if (!isDesktop) {
+                    add(PlaybackSearchRow("libass-render", stringResource(Res.string.settings_playback_render_type)))
+                }
+            },
         )
     }
     addPlaybackRows(

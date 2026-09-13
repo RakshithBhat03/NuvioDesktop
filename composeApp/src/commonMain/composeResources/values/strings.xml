@@ -613,6 +613,9 @@
     <string name="settings_licenses_attributions_exoplayer_title">AndroidX Media3 ExoPlayer 1.8.0</string>
     <string name="settings_licenses_attributions_exoplayer_body">Used for playback on Android builds.</string>
     <string name="settings_licenses_attributions_exoplayer_license">Licensed under the Apache License, Version 2.0.</string>
+    <string name="settings_licenses_attributions_mpv_title">mpv / libmpv</string>
+    <string name="settings_licenses_attributions_mpv_body">Used for playback on desktop builds.</string>
+    <string name="settings_licenses_attributions_mpv_license">Source code and license terms are available in the mpv repository.</string>
     <string name="compose_trakt_list_picker_loading">Loading your Trakt lists…</string>
     <string name="compose_trakt_list_picker_subtitle">Choose where to save this title on Trakt</string>
     <string name="compose_tracking_list_picker_loading">Loading lists…</string>
