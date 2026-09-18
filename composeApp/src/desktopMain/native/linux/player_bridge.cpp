@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <clocale>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +51,7 @@ namespace {
 
 JavaVM *gVm = nullptr;
 constexpr double kMaxVolumePercent = 200.0;
+constexpr double kCachedRangeEpsilon = 0.05;
 
 struct Player {
     mpv_handle *mpv = nullptr;
@@ -250,6 +252,47 @@ double mpvGetDouble(mpv_handle *mpv, const char *name) {
     double out = 0.0;
     if (mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &out) < 0) return 0.0;
     return out;
+}
+
+double mpvCachedEndForPosition(mpv_handle *mpv, double position) {
+    double best = position;
+    mpv_node state{};
+    if (mpv_get_property(mpv, "demuxer-cache-state", MPV_FORMAT_NODE, &state) < 0)
+        return best;
+    if (state.format == MPV_FORMAT_NODE_MAP && state.u.list) {
+        for (int index = 0; index < state.u.list->num; index++) {
+            if (std::strcmp(state.u.list->keys[index], "seekable-ranges") != 0)
+                continue;
+            mpv_node *ranges = &state.u.list->values[index];
+            if (ranges->format != MPV_FORMAT_NODE_ARRAY || !ranges->u.list)
+                break;
+            for (int rangeIndex = 0; rangeIndex < ranges->u.list->num; rangeIndex++) {
+                mpv_node *range = &ranges->u.list->values[rangeIndex];
+                if (range->format != MPV_FORMAT_NODE_MAP || !range->u.list)
+                    continue;
+                double start = NAN;
+                double end = NAN;
+                for (int valueIndex = 0; valueIndex < range->u.list->num; valueIndex++) {
+                    mpv_node *value = &range->u.list->values[valueIndex];
+                    if (value->format != MPV_FORMAT_DOUBLE)
+                        continue;
+                    const char *key = range->u.list->keys[valueIndex];
+                    if (std::strcmp(key, "start") == 0)
+                        start = value->u.double_;
+                    else if (std::strcmp(key, "end") == 0)
+                        end = value->u.double_;
+                }
+                if (std::isfinite(start) && std::isfinite(end) &&
+                    position >= start - kCachedRangeEpsilon &&
+                    position <= end + kCachedRangeEpsilon) {
+                    best = std::max(best, end);
+                }
+            }
+            break;
+        }
+    }
+    mpv_free_node_contents(&state);
+    return best;
 }
 
 int64_t mpvGetInt(mpv_handle *mpv, const char *name) {
@@ -867,16 +910,17 @@ gboolean pushPlayerUpdate(gpointer data) {
     }
     double duration = mpvGetDouble(player->mpv, "duration");
     double position = mpvGetDouble(player->mpv, "time-pos");
+    double buffered = mpvCachedEndForPosition(player->mpv, position);
     double volumeLevel = mpvGetDouble(player->mpv, "volume") / 100.0;
     volumeLevel = std::max(0.0, std::min(kMaxVolumePercent / 100.0, volumeLevel));
     bool paused = mpvGetFlag(player->mpv, "pause");
     bool loading = playerLoading(player);
     std::string audioTracks = buildTracksJson(player->mpv, "audio");
     std::string subtitleTracks = buildTracksJson(player->mpv, "sub");
-    char head[224];
+    char head[256];
     snprintf(head, sizeof(head),
-             "window.playerUpdate&&window.playerUpdate({duration:%0.3f,position:%0.3f,volumeLevel:%0.3f,paused:%s,loading:%s,audioTracks:",
-             duration, position, volumeLevel, paused ? "true" : "false", loading ? "true" : "false");
+             "window.playerUpdate&&window.playerUpdate({duration:%0.3f,position:%0.3f,buffered:%0.3f,volumeLevel:%0.3f,paused:%s,loading:%s,audioTracks:",
+             duration, position, buffered, volumeLevel, paused ? "true" : "false", loading ? "true" : "false");
     std::string js = std::string(head) + audioTracks +
                      ",subtitleTracks:" + subtitleTracks + "})";
     evalJs(player->webview, js);
@@ -1813,8 +1857,7 @@ JNIEXPORT jlong JNICALL NP(bufferedPositionMs)(JNIEnv *, jobject, jlong handle) 
     Player *p = asPlayer(handle);
     if (!p) return 0;
     double pos = mpvGetDouble(p->mpv, "time-pos");
-    double cache = mpvGetDouble(p->mpv, "demuxer-cache-time");
-    double buffered = cache > pos ? cache : pos;
+    double buffered = mpvCachedEndForPosition(p->mpv, pos);
     return static_cast<jlong>(buffered * 1000.0);
 }
 

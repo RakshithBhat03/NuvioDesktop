@@ -1404,6 +1404,8 @@ private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
         append(',')
         appendJsonField("themeTimelineTrackColor", themeTimelineTrackColor)
         append(',')
+        appendJsonField("themeTimelineBufferedColor", themeTimelineBufferedColor)
+        append(',')
         appendJsonField("themeBufferingColor", themeBufferingColor)
         append(',')
         appendJsonField("themeBufferingTrackColor", themeBufferingTrackColor)
