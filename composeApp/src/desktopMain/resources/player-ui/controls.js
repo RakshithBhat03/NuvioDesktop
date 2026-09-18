@@ -2603,17 +2603,18 @@ const fineSeek = isForward => {
   }, 800);
 };
 
-const sendKeyboardVolume = delta => {
+const sendKeyboardVolume = (delta, maxLevel = maxVolumeLevel) => {
   const currentLevel = typeof state.volumeLevel === "number" && Number.isFinite(state.volumeLevel)
     ? state.volumeLevel
     : 1;
-  if (delta > 0 && currentLevel >= standardMaxVolumeLevel) {
+  const capLevel = Math.max(0, Math.min(maxVolumeLevel, maxLevel));
+  if (delta > 0 && currentLevel >= capLevel) {
     showPlayerToast(volumeToastLabel(delta));
     return;
   }
   const adjustedLevel = currentLevel + (delta * volumeStepLevel);
   const nextLevel = delta > 0
-    ? Math.min(standardMaxVolumeLevel, clampVolumeLevel(adjustedLevel))
+    ? Math.min(capLevel, clampVolumeLevel(adjustedLevel))
     : clampVolumeLevel(adjustedLevel);
   state.volumeLevel = nextLevel;
   if (nextLevel > 0) {
@@ -3421,7 +3422,7 @@ root.addEventListener("wheel", event => {
   event.preventDefault();
   const delta = Math.sign(event.deltaY) * -1;
   if (delta !== 0) {
-    sendKeyboardVolume(delta);
+    sendKeyboardVolume(delta, standardMaxVolumeLevel);
   }
 }, { passive: false });
 
