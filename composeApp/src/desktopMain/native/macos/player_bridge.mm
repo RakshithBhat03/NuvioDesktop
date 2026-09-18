@@ -12,10 +12,13 @@
 #include <mpv/render.h>
 #include <mpv/render_gl.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <dlfcn.h>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifndef NX_SUBTYPE_AUX_CONTROL_BUTTONS
@@ -43,6 +46,37 @@
 #endif
 
 static constexpr double kMaxVolumePercent = 200.0;
+// mpv exposes cached seekable spans, not the last cached packet. The two differ
+// by the tail of a GOP, and only the spans can be seeked without a source read.
+static constexpr double kCachedRangeEpsilon = 0.05;
+
+// True when the supplied cached time ranges form one continuous span, so the
+// beginning/end cached flags cannot hide a hole in the middle.
+static bool nuvioCachedRangesCoverContinuously(
+    const std::vector<std::pair<double, double>> &ranges,
+    double gapToleranceSeconds = 0.5) {
+    std::vector<std::pair<double, double>> valid;
+    for (const auto &range : ranges) {
+        if (std::isfinite(range.first) && std::isfinite(range.second) &&
+            range.second > range.first) {
+            valid.push_back(range);
+        }
+    }
+    if (valid.empty()) {
+        return false;
+    }
+    std::sort(valid.begin(), valid.end(), [](const auto &left, const auto &right) {
+        return left.first < right.first;
+    });
+    double coveredEnd = valid.front().second;
+    for (size_t index = 1; index < valid.size(); index++) {
+        if (valid[index].first > coveredEnd + gapToleranceSeconds) {
+            return false;
+        }
+        coveredEnd = std::max(coveredEnd, valid[index].second);
+    }
+    return true;
+}
 
 @class PlayerMetalView;
 @class MpvWebPlayer;
@@ -110,6 +144,11 @@ static constexpr double kMaxVolumePercent = 200.0;
 - (long long)durationMs;
 - (long long)positionMs;
 - (long long)bufferedPositionMs;
+- (BOOL)cachedSpanForPosition:(double)position start:(double *)outStart end:(double *)outEnd;
+- (void)readCacheStatusDownloadSpeed:(double *)outSpeed
+                        cachedRanges:(NSString **)outCachedRanges
+                         fullyCached:(BOOL *)outFullyCached
+                       networkStream:(BOOL *)outNetworkStream;
 - (BOOL)isLoading;
 - (BOOL)isEnded;
 - (NSString *)audioTracksJson;
@@ -1044,7 +1083,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     BOOL _controlsWebReady;
     BOOL _fullscreenTransitionActive;
     NSString *_pendingControlsJson;
-    double _initialStartSeconds;
+    NSString *_sourceUrl;
     BOOL _controlsSyncInFlight;
     NSRect _lastAppliedNativeLayoutBounds;
     BOOL _lastAppliedNativeLayoutWasLiveResize;
@@ -1461,7 +1500,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                                        reason:@"mpv_create failed"
                                      userInfo:nil];
     }
-    _initialStartSeconds = initialPositionMs > 0 ? (double)initialPositionMs / 1000.0 : 0.0;
+    _sourceUrl = [sourceUrl copy];
 
     setMpvOptionString(_mpv, "config", "no");
     setMpvOptionString(_mpv, "osc", "no");
@@ -1489,8 +1528,14 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     setMpvOptionString(_mpv, "tone-mapping", "auto");
     setMpvOptionString(_mpv, "hdr-compute-peak", "no");
     setMpvOptionString(_mpv, "dither-depth", "auto");
-    setMpvOptionString(_mpv, "demuxer-max-bytes", "150MiB");
-    setMpvOptionString(_mpv, "cache-secs", "120");
+    // Match the Windows cache shape so long pauses resume from RAM.
+    setMpvOptionString(_mpv, "demuxer-max-bytes", "512MiB");
+    setMpvOptionString(_mpv, "demuxer-max-back-bytes", "256MiB");
+    setMpvOptionString(_mpv, "demuxer-seekable-cache", "yes");
+    setMpvOptionString(_mpv, "cache-secs", "36000");
+    // Retain embedded subtitle and audio packets for track switches in bounded RAM.
+    setMpvOptionString(_mpv, "demuxer-subtitle-cache-bytes", "32MiB");
+    setMpvOptionString(_mpv, "demuxer-audio-cache-bytes", "64MiB");
     setMpvOptionString(_mpv, "hr-seek", "no");
 
     if (headerLines.count > 0) {
@@ -1561,6 +1606,15 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
             double position = [self doubleProperty:"time-pos" fallback:0.0];
             double volumeLevel = [self volume];
             double cacheAhead = [self cacheAheadSecondsForPosition:position];
+            double buffered = fmax(position + cacheAhead, position);
+            double downloadSpeed = 0.0;
+            NSString *cachedRanges = @"[]";
+            BOOL fullyCached = NO;
+            BOOL networkStream = NO;
+            [self readCacheStatusDownloadSpeed:&downloadSpeed
+                                  cachedRanges:&cachedRanges
+                                   fullyCached:&fullyCached
+                                 networkStream:&networkStream];
             BOOL paused = [self rawIsPaused];
             BOOL ended = [self rawIsEnded];
             BOOL loading = [self rawLoadingWithPaused:paused ended:ended duration:duration];
@@ -1583,10 +1637,19 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                     return;
                 }
                 [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"sync" force:NO];
+                NSString *cacheStatus = cachedRanges
+                    ? [NSString stringWithFormat:@"cachedRanges:%@,downloadSpeed:%0.3f,fullyCached:%@,networkStream:%@",
+                        cachedRanges,
+                        downloadSpeed,
+                        fullyCached ? @"true" : @"false",
+                        networkStream ? @"true" : @"false"]
+                    : @"cachedRanges:null,downloadSpeed:null,fullyCached:null,networkStream:null";
                 NSString *script = [NSString stringWithFormat:
-                    @"window.playerUpdate({duration:%0.3f,position:%0.3f,volumeLevel:%0.3f,paused:%@,loading:%@,audioTracks:%@,subtitleTracks:%@})",
+                    @"window.playerUpdate({duration:%0.3f,position:%0.3f,buffered:%0.3f,%@,volumeLevel:%0.3f,paused:%@,loading:%@,audioTracks:%@,subtitleTracks:%@})",
                     duration,
                     position,
+                    buffered,
+                    cacheStatus,
                     volumeLevel,
                     paused ? @"true" : @"false",
                     loading ? @"true" : @"false",
@@ -1950,38 +2013,162 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     return std::isfinite(position) ? fmax(position, 0.0) : 0.0;
 }
 
-- (double)effectiveCachePositionSeconds {
-    double position = [self rawPositionSeconds];
-    if (_initialStartSeconds > 0.0 && position + 5.0 < _initialStartSeconds) {
-        return _initialStartSeconds;
-    }
-    return position;
-}
-
 - (double)cacheAheadSeconds {
     return [self cacheAheadSecondsForPosition:[self rawPositionSeconds]];
 }
 
+// Cached demuxer span containing `position`, as mpv reports it. Only this span
+// can be seeked without reading the source again: `demuxer-cache-time` also
+// covers the tail of the last GOP, which mpv answers with a fresh source seek.
+- (BOOL)cachedSpanForPosition:(double)position start:(double *)outStart end:(double *)outEnd {
+    if (!_mpv || !std::isfinite(position)) {
+        return NO;
+    }
+    mpv_node state = {0};
+    if (mpv_get_property(_mpv, "demuxer-cache-state", MPV_FORMAT_NODE, &state) < 0) {
+        return NO;
+    }
+    BOOL found = NO;
+    double bestStart = 0.0;
+    double bestEnd = 0.0;
+    if (state.format == MPV_FORMAT_NODE_MAP && state.u.list) {
+        for (int i = 0; i < state.u.list->num; i++) {
+            if (std::strcmp(state.u.list->keys[i], "seekable-ranges") != 0) {
+                continue;
+            }
+            mpv_node *ranges = &state.u.list->values[i];
+            if (ranges->format != MPV_FORMAT_NODE_ARRAY || !ranges->u.list) {
+                break;
+            }
+            for (int n = 0; n < ranges->u.list->num; n++) {
+                mpv_node *range = &ranges->u.list->values[n];
+                if (range->format != MPV_FORMAT_NODE_MAP || !range->u.list) {
+                    continue;
+                }
+                double start = NAN;
+                double end = NAN;
+                for (int j = 0; j < range->u.list->num; j++) {
+                    const char *key = range->u.list->keys[j];
+                    mpv_node *value = &range->u.list->values[j];
+                    if (value->format != MPV_FORMAT_DOUBLE) {
+                        continue;
+                    }
+                    if (std::strcmp(key, "start") == 0) {
+                        start = value->u.double_;
+                    } else if (std::strcmp(key, "end") == 0) {
+                        end = value->u.double_;
+                    }
+                }
+                if (!std::isfinite(start) || !std::isfinite(end)) {
+                    continue;
+                }
+                if (position < start - kCachedRangeEpsilon || position > end + kCachedRangeEpsilon) {
+                    continue;
+                }
+                if (!found || end > bestEnd) {
+                    found = YES;
+                    bestStart = start;
+                    bestEnd = end;
+                }
+            }
+            break;
+        }
+    }
+    mpv_free_node_contents(&state);
+    if (!found) {
+        return NO;
+    }
+    if (outStart) *outStart = bestStart;
+    if (outEnd) *outEnd = bestEnd;
+    return YES;
+}
+
 - (double)cacheAheadSecondsForPosition:(double)position {
     double safePosition = std::isfinite(position) ? fmax(position, 0.0) : 0.0;
-    double effectivePosition = safePosition;
-    if (_initialStartSeconds > 0.0 && safePosition + 5.0 < _initialStartSeconds) {
-        effectivePosition = _initialStartSeconds;
+    double start = 0.0;
+    double end = 0.0;
+    if (![self cachedSpanForPosition:safePosition start:&start end:&end]) {
+        return 0.0;
     }
-    double cacheTime = [self doubleProperty:"demuxer-cache-time" fallback:0.0];
-    if (std::isfinite(cacheTime) && cacheTime > 0.0) {
-        if (cacheTime >= effectivePosition - 5.0) {
-            return fmax(cacheTime - effectivePosition, 0.0);
+    return fmax(end - safePosition, 0.0);
+}
+
+#pragma mark - Cache reporting
+
+// Live transfer and cache state for the stream behind the source button:
+// current input rate, the cached spans themselves (the controls page measures
+// them against the playhead or the scrub pointer), whether the whole stream is
+// local, and whether this is a network stream.
+- (void)readCacheStatusDownloadSpeed:(double *)outSpeed
+                        cachedRanges:(NSString **)outCachedRanges
+                         fullyCached:(BOOL *)outFullyCached
+                       networkStream:(BOOL *)outNetworkStream {
+    double speed = 0.0;
+    NSMutableString *rangesJson = [NSMutableString stringWithString:@"["];
+    NSUInteger rangeCount = 0;
+    BOOL fullyCached = NO;
+    BOOL networkStream = NO;
+    std::vector<std::pair<double, double>> cachedRangeValues;
+    if (_mpv) {
+        // Local files reach the bridge as plain paths; anything else fetched
+        // over http(s) counts as a network stream.
+        NSString *source = [_sourceUrl lowercaseString];
+        networkStream = [source hasPrefix:@"http://"] || [source hasPrefix:@"https://"];
+        mpv_node state = {0};
+        if (mpv_get_property(_mpv, "demuxer-cache-state", MPV_FORMAT_NODE, &state) >= 0) {
+            BOOL bofCached = NO;
+            BOOL eofCached = NO;
+            if (state.format == MPV_FORMAT_NODE_MAP && state.u.list) {
+                for (int i = 0; i < state.u.list->num; i++) {
+                    const char *key = state.u.list->keys[i];
+                    mpv_node *value = &state.u.list->values[i];
+                    if (std::strcmp(key, "raw-input-rate") == 0 && value->format == MPV_FORMAT_INT64) {
+                        speed = (double)value->u.int64;
+                    } else if (std::strcmp(key, "bof-cached") == 0 && value->format == MPV_FORMAT_FLAG) {
+                        bofCached = value->u.flag != 0;
+                    } else if (std::strcmp(key, "eof-cached") == 0 && value->format == MPV_FORMAT_FLAG) {
+                        eofCached = value->u.flag != 0;
+                    } else if (std::strcmp(key, "seekable-ranges") == 0 &&
+                               value->format == MPV_FORMAT_NODE_ARRAY && value->u.list) {
+                        for (int n = 0; n < value->u.list->num; n++) {
+                            mpv_node *range = &value->u.list->values[n];
+                            if (range->format != MPV_FORMAT_NODE_MAP || !range->u.list) {
+                                continue;
+                            }
+                            double start = NAN;
+                            double end = NAN;
+                            for (int j = 0; j < range->u.list->num; j++) {
+                                if (range->u.list->values[j].format != MPV_FORMAT_DOUBLE) {
+                                    continue;
+                                }
+                                if (std::strcmp(range->u.list->keys[j], "start") == 0) {
+                                    start = range->u.list->values[j].u.double_;
+                                } else if (std::strcmp(range->u.list->keys[j], "end") == 0) {
+                                    end = range->u.list->values[j].u.double_;
+                                }
+                            }
+                            if (std::isfinite(start) && std::isfinite(end) && end > start) {
+                                cachedRangeValues.emplace_back(start, end);
+                                if (rangeCount > 0) {
+                                    [rangesJson appendString:@","];
+                                }
+                                [rangesJson appendFormat:@"[%0.3f,%0.3f]", start, end];
+                                rangeCount++;
+                            }
+                        }
+                    }
+                }
+            }
+            fullyCached = bofCached && eofCached &&
+                nuvioCachedRangesCoverContinuously(cachedRangeValues);
+            mpv_free_node_contents(&state);
         }
-        return cacheTime;
     }
-
-    double cacheDuration = [self doubleProperty:"demuxer-cache-duration" fallback:0.0];
-    if (std::isfinite(cacheDuration) && cacheDuration > 0.0) {
-        return cacheDuration;
-    }
-
-    return 0.0;
+    [rangesJson appendString:@"]"];
+    if (outSpeed) *outSpeed = speed;
+    if (outCachedRanges) *outCachedRanges = [rangesJson copy];
+    if (outFullyCached) *outFullyCached = fullyCached;
+    if (outNetworkStream) *outNetworkStream = networkStream;
 }
 
 - (long long)bufferedPositionMs {
@@ -2138,13 +2325,16 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                               value:[resolvedBackgroundColor hasPrefix:@"#00"] ? @"outline-and-shadow" : @"opaque-box"];
         }
         if (modeChanged || outlineColorChanged) {
-            [self setStringProperty:"sub-outline-color" value:resolvedOutlineColor];
+            // The bundled mpv exposes the outline only as --sub-border-color;
+            // --sub-outline-color fails silently here.
+            [self setStringProperty:"sub-border-color" value:resolvedOutlineColor];
         }
         if (modeChanged || boldChanged) {
             [self setStringProperty:"sub-bold" value:bold ? @"yes" : @"no"];
         }
         if (modeChanged || outlineSizeChanged) {
-            mpv_set_property(_mpv, "sub-outline-size", MPV_FORMAT_DOUBLE, &outline);
+            // Outline size uses the same --sub-border-* naming as the color.
+            mpv_set_property(_mpv, "sub-border-size", MPV_FORMAT_DOUBLE, &outline);
         }
     }
     if (stripSdhChanged) {

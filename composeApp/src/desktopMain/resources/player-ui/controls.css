@@ -1566,7 +1566,10 @@ button:disabled {
   height: 10px;
   border-radius: 999px;
   background:
-    linear-gradient(to right, var(--theme-timeline-fill) 0 var(--progress, 0%), var(--theme-timeline-track) var(--progress, 0%) 100%);
+    linear-gradient(to right,
+      var(--theme-timeline-fill) 0 var(--progress, 0%),
+      var(--theme-timeline-buffered, rgba(255, 255, 255, .55)) var(--progress, 0%) var(--buffered, 0%),
+      var(--theme-timeline-track) var(--buffered, 0%) 100%);
 }
 
 .scrub::-webkit-slider-thumb {
@@ -1728,6 +1731,66 @@ button:disabled {
   border-radius: 24px;
   background: rgba(0, 0, 0, .5);
   overflow: hidden;
+}
+
+.cache-status {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--theme-control-foreground);
+  font-size: 12px;
+  line-height: 1;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  text-shadow: 0 2px 12px rgba(0, 0, 0, .7);
+}
+
+.cache-status[hidden] {
+  display: none;
+}
+
+.cache-status-speed[hidden],
+.cache-status-separator[hidden],
+.cache-status-time[hidden] {
+  display: none;
+}
+
+.cache-status svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  opacity: .9;
+}
+
+.cache-status.is-cached svg {
+  color: var(--theme-accent-strong);
+  opacity: 1;
+}
+
+.cache-status-separator {
+  color: var(--theme-text-secondary);
+}
+
+.cache-status-time {
+  color: var(--theme-control-foreground);
+}
+
+/* Keep the control row readable as the window narrows: the speed drops first,
+   the whole status goes away before the action buttons would run into the
+   volume and time labels. */
+@media (max-width: 1100px) {
+  .cache-status-speed,
+  .cache-status-separator {
+    display: none;
+  }
+}
+
+@media (max-width: 900px) {
+  .cache-status {
+    display: none;
+  }
 }
 
 .action {

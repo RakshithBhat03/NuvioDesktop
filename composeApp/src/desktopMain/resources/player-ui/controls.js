@@ -71,6 +71,11 @@ const nextEpisodeStatus = document.getElementById("nextEpisodeStatus");
 const nextEpisodeAction = document.getElementById("nextEpisodeAction");
 const sourcesButton = document.getElementById("sourcesButton");
 const episodesButton = document.getElementById("episodesButton");
+const cacheStatus = document.getElementById("cacheStatus");
+const cacheStatusIconUse = document.getElementById("cacheStatusIconUse");
+const cacheStatusSpeed = document.getElementById("cacheStatusSpeed");
+const cacheStatusSeparator = document.getElementById("cacheStatusSeparator");
+const cacheStatusTime = document.getElementById("cacheStatusTime");
 const audioModal = document.getElementById("audioModal");
 const subtitleModal = document.getElementById("subtitleModal");
 const speedModal = document.getElementById("speedModal");
@@ -259,6 +264,7 @@ let state = {
   themeSelectedRingColor: "rgba(47, 111, 237, .35)",
   themeTimelineFillColor: "#fff",
   themeTimelineTrackColor: "rgba(255, 255, 255, .28)",
+  themeTimelineBufferedColor: "rgba(255, 255, 255, .55)",
   themeBufferingColor: "#fff",
   themeBufferingTrackColor: "rgba(255, 255, 255, .28)",
   themeControlForegroundColor: "#fff",
@@ -299,6 +305,14 @@ let state = {
   showExternalPlayer: false,
   durationMs: 0,
   positionMs: 0,
+  bufferedMs: 0,
+  cachedRanges: [],
+  downloadSpeedBytes: 0,
+  fullyCached: false,
+  networkStream: false,
+  p2pActive: false,
+  p2pDownloadSpeedBytes: 0,
+  p2pLoadedFraction: 0,
   audioTracks: [],
   subtitleTracks: [],
   sourceIsLoading: false,
@@ -744,6 +758,7 @@ const applyTheme = () => {
   setColor("--theme-selected-ring", state.themeSelectedRingColor, "rgba(47, 111, 237, .35)");
   setColor("--theme-timeline-fill", state.themeTimelineFillColor, "#fff");
   setColor("--theme-timeline-track", state.themeTimelineTrackColor, "rgba(255, 255, 255, .28)");
+  setColor("--theme-timeline-buffered", state.themeTimelineBufferedColor, "rgba(255, 255, 255, .55)");
   setColor("--theme-buffering", state.themeBufferingColor, "#fff");
   setColor("--theme-buffering-track", state.themeBufferingTrackColor, "rgba(255, 255, 255, .28)");
   setColor("--theme-control-foreground", state.themeControlForegroundColor, "#fff");
@@ -769,14 +784,100 @@ const formatTime = milliseconds => {
 
 const setProgress = (positionMs, durationMs) => {
   const percent = durationMs > 0 ? Math.max(0, Math.min(100, positionMs / durationMs * 100)) : 0;
+  const bufferedMs = Math.max(0, Number(state.bufferedMs) || 0);
+  const bufferedPercent = durationMs > 0
+    ? Math.max(percent, Math.min(100, bufferedMs / durationMs * 100))
+    : percent;
   seek.value = Math.round(percent * 10);
   seek.style.setProperty("--progress", `${percent}%`);
+  seek.style.setProperty("--buffered", `${bufferedPercent}%`);
   positionLabel.textContent = formatTime(positionMs);
   durationLabel.textContent = formatTime(durationMs);
   if (timeLabel) {
     timeLabel.textContent = `${formatTime(positionMs)} / ${formatTime(durationMs)}`;
   }
+  renderCacheStatus();
   syncVolumeControl();
+};
+
+const formatTransferSpeed = bytesPerSecond => {
+  const value = Number(bytesPerSecond);
+  if (!Number.isFinite(value) || value <= 0) {
+    return "";
+  }
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)} GB/s`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)} MB/s`;
+  if (value >= 1e3) return `${Math.round(value / 1e3)} KB/s`;
+  return `${Math.round(value)} B/s`;
+};
+
+const formatCachedDuration = seconds => {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  if (total < 60) return `${total}s`;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainingSeconds = total % 60;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+};
+
+// Live transfer and cache state for the stream, shown beside the source button.
+// The cached time is measured from the current playback position, or from the
+// scrub pointer while the bar is dragged, so the number always describes the
+// media that is cached at the place being played or picked.
+const renderCacheStatus = () => {
+  if (!cacheStatus) {
+    return;
+  }
+  const durationSeconds = Number(state.durationMs) > 0 ? Number(state.durationMs) / 1000 : 0;
+  const displaySeconds = isScrubbing && Number.isFinite(Number(scrubPositionMs))
+    ? Math.max(0, Number(scrubPositionMs) / 1000)
+    : Math.max(0, Number(state.positionMs) / 1000);
+  const ranges = Array.isArray(state.cachedRanges) ? state.cachedRanges : [];
+  const cachedRange = ranges.find(range =>
+    displaySeconds >= range[0] - 0.5 && displaySeconds <= range[1] + 0.5) || null;
+  const cachedAheadSeconds = cachedRange ? Math.max(0, cachedRange[1] - displaySeconds) : 0;
+  const cachedWindowSeconds = cachedRange ? Math.max(0, cachedRange[1] - cachedRange[0]) : 0;
+  const p2pLoadedFraction = Math.max(0, Math.min(1, Number(state.p2pLoadedFraction) || 0));
+  const p2pSpeed = Number(state.p2pDownloadSpeedBytes) || 0;
+  const fullyCached = (state.p2pActive && p2pLoadedFraction >= 0.999) || Boolean(state.fullyCached);
+  const hasP2pStatus = Boolean(state.p2pActive) && (p2pSpeed > 0 || p2pLoadedFraction > 0);
+  const visible = (Boolean(state.networkStream) || Boolean(state.p2pActive)) &&
+    durationSeconds > 0 &&
+    (fullyCached || ranges.length > 0 || hasP2pStatus);
+  setVisible(cacheStatus, visible);
+  if (!visible) {
+    return;
+  }
+  const speedBytes = state.p2pActive && p2pSpeed > 0
+    ? p2pSpeed
+    : Number(state.downloadSpeedBytes) || 0;
+  const speedText = fullyCached ? "" : formatTransferSpeed(speedBytes);
+  const cachedSeconds = fullyCached
+    ? durationSeconds
+    : state.p2pActive && p2pLoadedFraction > 0
+      ? durationSeconds * p2pLoadedFraction
+      : cachedAheadSeconds;
+  const cachedText = formatCachedDuration(cachedSeconds);
+  cacheStatus.classList.toggle("is-cached", fullyCached);
+  if (cacheStatusIconUse) {
+    cacheStatusIconUse.setAttribute("href", fullyCached ? "#icon-check" : "#icon-download");
+  }
+  cacheStatusSpeed.textContent = speedText;
+  setVisible(cacheStatusSpeed, Boolean(speedText));
+  setVisible(cacheStatusSeparator, Boolean(speedText) && Boolean(cachedText));
+  cacheStatusTime.textContent = cachedText;
+  if (fullyCached) {
+    cacheStatus.title = `Fully cached · ${cachedText}`;
+  } else {
+    const windowHint = cachedWindowSeconds > cachedAheadSeconds + 1
+      ? `${formatCachedDuration(cachedWindowSeconds)} cached in this window`
+      : "";
+    const cachedLabel = state.p2pActive ? `${cachedText} cached` : `${cachedText} cached ahead`;
+    cacheStatus.title = [speedText, cachedLabel, windowHint]
+      .filter(Boolean)
+      .join(" · ");
+  }
 };
 
 const setText = (element, text) => {
@@ -2963,6 +3064,15 @@ volumeButton.addEventListener("click", () => {
 window.playerUpdate = update => {
   const durationMs = Math.round((Number(update.duration) || 0) * 1000);
   const positionMs = Math.round((Number(update.position) || 0) * 1000);
+  const bufferedMs = Number.isFinite(Number(update.buffered))
+    ? Math.max(0, Math.round(Number(update.buffered) * 1000))
+    : state.bufferedMs;
+  const cachedRanges = Array.isArray(update.cachedRanges)
+    ? update.cachedRanges
+        .filter(range => Array.isArray(range) && range.length >= 2)
+        .map(range => [Number(range[0]), Number(range[1])])
+        .filter(range => Number.isFinite(range[0]) && Number.isFinite(range[1]) && range[1] > range[0])
+    : state.cachedRanges;
   const reportedVolumeLevel = Number(update.volumeLevel);
   const volumeLevel = Number.isFinite(reportedVolumeLevel)
     ? clampVolumeLevel(reportedVolumeLevel)
@@ -2982,6 +3092,11 @@ window.playerUpdate = update => {
     ...state,
     durationMs,
     positionMs,
+    bufferedMs,
+    cachedRanges,
+    downloadSpeedBytes: Number.isFinite(Number(update.downloadSpeed)) ? Number(update.downloadSpeed) : state.downloadSpeedBytes,
+    fullyCached: update.fullyCached == null ? state.fullyCached : Boolean(update.fullyCached),
+    networkStream: update.networkStream == null ? state.networkStream : Boolean(update.networkStream),
     isPlaying: pendingIsPlaying === null ? nativeIsPlaying : pendingIsPlaying,
     isLoading: Boolean(update.loading || update.isLoading),
     volumeLevel,

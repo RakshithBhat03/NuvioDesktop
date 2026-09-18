@@ -830,12 +830,14 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_property_string(mpv, "sub-ass-override", "no"))
         checkError(mpv_set_property_string(mpv, "sub-color", textColor))
         checkError(mpv_set_property_string(mpv, "sub-back-color", backgroundColor))
-        checkError(mpv_set_property_string(mpv, "sub-outline-color", outlineColor))
+        // --sub-border-color/--sub-border-size work on every mpv revision, unlike
+        // the --sub-outline-* names used by newer builds.
+        checkError(mpv_set_property_string(mpv, "sub-border-color", outlineColor))
         checkError(mpv_set_property_string(mpv, "sub-border-style", backgroundColor.hasPrefix("#00") ? "outline-and-shadow" : "opaque-box"))
         setStringProperty("sub-bold", bold ? "yes" : "no")
 
         var outline = Double(outlineSize)
-        checkError(mpv_set_property(mpv, "sub-outline-size", MPV_FORMAT_DOUBLE, &outline))
+        checkError(mpv_set_property(mpv, "sub-border-size", MPV_FORMAT_DOUBLE, &outline))
 
         var size = Double(fontSize)
         checkError(mpv_set_property(mpv, "sub-font-size", MPV_FORMAT_DOUBLE, &size))

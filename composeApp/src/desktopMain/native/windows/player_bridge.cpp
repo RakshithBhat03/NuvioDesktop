@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cwctype>
 #include <deque>
 #include <functional>
@@ -41,7 +42,31 @@ typedef enum mpv_format {
     MPV_FORMAT_FLAG = 3,
     MPV_FORMAT_INT64 = 4,
     MPV_FORMAT_DOUBLE = 5,
+    MPV_FORMAT_NODE = 6,
+    MPV_FORMAT_NODE_ARRAY = 7,
+    MPV_FORMAT_NODE_MAP = 8,
+    MPV_FORMAT_BYTE_ARRAY = 9,
 } mpv_format;
+
+typedef struct mpv_node mpv_node;
+
+typedef struct mpv_node_list {
+    int num;
+    mpv_node *values;
+    char **keys;
+} mpv_node_list;
+
+struct mpv_node {
+    union {
+        char *string;
+        int flag;
+        int64_t int64;
+        double double_;
+        mpv_node_list *list;
+        void *ba;
+    } u;
+    mpv_format format;
+};
 
 typedef enum mpv_event_id {
     MPV_EVENT_NONE = 0,
@@ -67,6 +92,7 @@ constexpr UINT_PTR NUVIO_TIMER_ID = 0x4E50;
 constexpr UINT kUiTaskTimeoutMs = 2000;
 constexpr UINT kShutdownJoinTimeoutMs = 3000;
 constexpr double kMaxVolumePercent = 200.0;
+constexpr double kCachedRangeEpsilon = 0.05;
 
 const wchar_t *kMessageWindowClass = L"NuvioPlayerBridgeMessageWindow";
 const wchar_t *kContainerWindowClass = L"NuvioPlayerBridgeContainerWindow";
@@ -492,6 +518,7 @@ struct MpvApi {
     using mpv_set_property_fn = int (*)(mpv_handle *, const char *, mpv_format, void *);
     using mpv_set_property_string_fn = int (*)(mpv_handle *, const char *, const char *);
     using mpv_get_property_fn = int (*)(mpv_handle *, const char *, mpv_format, void *);
+    using mpv_free_node_contents_fn = void (*)(mpv_node *);
     using mpv_command_fn = int (*)(mpv_handle *, const char **);
     using mpv_error_string_fn = const char *(*)(int);
     using mpv_free_fn = void (*)(void *);
@@ -510,6 +537,7 @@ struct MpvApi {
     mpv_set_property_fn setProperty = nullptr;
     mpv_set_property_string_fn setPropertyString = nullptr;
     mpv_get_property_fn getProperty = nullptr;
+    mpv_free_node_contents_fn freeNodeContents = nullptr;
     mpv_command_fn command = nullptr;
     mpv_error_string_fn errorString = nullptr;
     mpv_free_fn freeValue = nullptr;
@@ -569,6 +597,7 @@ struct MpvApi {
         setProperty = loadSymbol<mpv_set_property_fn>("mpv_set_property");
         setPropertyString = loadSymbol<mpv_set_property_string_fn>("mpv_set_property_string");
         getProperty = loadSymbol<mpv_get_property_fn>("mpv_get_property");
+        freeNodeContents = loadSymbol<mpv_free_node_contents_fn>("mpv_free_node_contents");
         command = loadSymbol<mpv_command_fn>("mpv_command");
         errorString = loadSymbol<mpv_error_string_fn>("mpv_error_string");
         freeValue = loadSymbol<mpv_free_fn>("mpv_free");
@@ -1106,7 +1135,10 @@ public:
     }
 
     long long bufferedPositionMs() {
-        double buffered = rawPositionSeconds() + cacheAheadSeconds();
+        double position = rawPositionSeconds();
+        double probePosition = effectiveCachePositionSeconds();
+        double buffered = cachedSpanEndForPosition(probePosition);
+        buffered = std::max(buffered, position);
         return (long long)std::llround(std::max(buffered, 0.0) * 1000.0);
     }
 
@@ -1246,7 +1278,9 @@ public:
                 );
             }
             if (modeChanged || outlineColorChanged) {
-                setStringProperty("sub-outline-color", resolvedOutlineColor);
+                // --sub-border-color works on every mpv revision, unlike the
+                // --sub-outline-color name used by newer builds.
+                setStringProperty("sub-border-color", resolvedOutlineColor);
             }
             if (modeChanged || boldChanged) {
                 setStringProperty("sub-bold", bold ? "yes" : "no");
@@ -1254,7 +1288,7 @@ public:
             if (modeChanged || outlineSizeChanged) {
                 std::lock_guard<std::mutex> lock(mpvMutex);
                 if (!mpv) return;
-                mpvApi().setProperty(mpv, "sub-outline-size", MPV_FORMAT_DOUBLE, &outline);
+                mpvApi().setProperty(mpv, "sub-border-size", MPV_FORMAT_DOUBLE, &outline);
             }
         }
         if (stripSdhChanged) {
@@ -1766,6 +1800,7 @@ private:
         if (!webView) return;
         double duration = doubleProperty("duration", 0.0);
         double position = doubleProperty("time-pos", 0.0);
+        double buffered = bufferedPositionMs() / 1000.0;
         double volumeLevel = volume();
         bool paused = isPaused();
         bool loading = isLoading();
@@ -1775,6 +1810,7 @@ private:
         std::ostringstream script;
         script << "window.playerUpdate({duration:" << duration
                << ",position:" << position
+               << ",buffered:" << std::max(buffered, position)
                << ",volumeLevel:" << volumeLevel
                << ",paused:" << (paused ? "true" : "false")
                << ",loading:" << (loading ? "true" : "false")
@@ -2018,21 +2054,47 @@ private:
         return position;
     }
 
-    double cacheAheadSeconds() {
-        double effectivePosition = effectiveCachePositionSeconds();
-        double cacheTime = doubleProperty("demuxer-cache-time", 0.0);
-        if (std::isfinite(cacheTime) && cacheTime > 0.0) {
-            if (cacheTime >= effectivePosition - 5.0) {
-                return std::max(cacheTime - effectivePosition, 0.0);
+    double cachedSpanEndForPosition(double position) {
+        double best = position;
+        std::lock_guard<std::mutex> lock(mpvMutex);
+        if (!mpv) return best;
+        mpv_node state{};
+        if (mpvApi().getProperty(mpv, "demuxer-cache-state", MPV_FORMAT_NODE, &state) < 0)
+            return best;
+        if (state.format == MPV_FORMAT_NODE_MAP && state.u.list) {
+            for (int index = 0; index < state.u.list->num; index++) {
+                if (std::strcmp(state.u.list->keys[index], "seekable-ranges") != 0)
+                    continue;
+                mpv_node *ranges = &state.u.list->values[index];
+                if (ranges->format != MPV_FORMAT_NODE_ARRAY || !ranges->u.list)
+                    break;
+                for (int rangeIndex = 0; rangeIndex < ranges->u.list->num; rangeIndex++) {
+                    mpv_node *range = &ranges->u.list->values[rangeIndex];
+                    if (range->format != MPV_FORMAT_NODE_MAP || !range->u.list)
+                        continue;
+                    double start = NAN;
+                    double end = NAN;
+                    for (int valueIndex = 0; valueIndex < range->u.list->num; valueIndex++) {
+                        mpv_node *value = &range->u.list->values[valueIndex];
+                        if (value->format != MPV_FORMAT_DOUBLE)
+                            continue;
+                        const char *key = range->u.list->keys[valueIndex];
+                        if (std::strcmp(key, "start") == 0)
+                            start = value->u.double_;
+                        else if (std::strcmp(key, "end") == 0)
+                            end = value->u.double_;
+                    }
+                    if (std::isfinite(start) && std::isfinite(end) &&
+                        position >= start - kCachedRangeEpsilon &&
+                        position <= end + kCachedRangeEpsilon) {
+                        best = std::max(best, end);
+                    }
+                }
+                break;
             }
-            return cacheTime;
         }
-
-        double cacheDuration = doubleProperty("demuxer-cache-duration", 0.0);
-        if (std::isfinite(cacheDuration) && cacheDuration > 0.0) {
-            return cacheDuration;
-        }
-        return 0.0;
+        mpvApi().freeNodeContents(&state);
+        return best;
     }
 
     void removeExternalSubtitleTracks() {
