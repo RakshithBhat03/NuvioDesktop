@@ -1168,6 +1168,8 @@
     <string name="settings_playback_reuse_binge_group">Reuse Binge Group</string>
     <string name="settings_playback_reuse_binge_group_description">Remember and reuse the last binge group across sessions (Continue Watching, Details, etc.).</string>
     <string name="settings_playback_preferred_audio_language">Preferred Audio Language</string>
+    <string name="settings_playback_remember_series_tracks">Remember Tracks Across Episodes</string>
+    <string name="settings_playback_remember_series_tracks_description">Use the last audio and subtitle languages selected in a series for episodes without saved choices.</string>
     <string name="settings_playback_preferred_subtitle_language">Preferred Language</string>
     <string name="settings_playback_presets">Presets</string>
     <string name="settings_playback_regex_matches_against">Matches against stream name/title/description/addon/url. Example: 4K|2160p|Remux</string>

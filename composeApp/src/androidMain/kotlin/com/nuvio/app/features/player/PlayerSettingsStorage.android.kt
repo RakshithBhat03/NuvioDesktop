@@ -38,6 +38,7 @@ actual object PlayerSettingsStorage {
     private const val secondaryPreferredAudioLanguageKey = "secondary_preferred_audio_language"
     private const val preferredSubtitleLanguageKey = "preferred_subtitle_language"
     private const val secondaryPreferredSubtitleLanguageKey = "secondary_preferred_subtitle_language"
+    private const val rememberSeriesTrackSelectionsKey = "remember_series_track_selections"
     private const val subtitleTextColorKey = "subtitle_text_color"
     private const val subtitleBackgroundColorKey = "subtitle_background_color"
     private const val subtitleOutlineColorKey = "subtitle_outline_color"
@@ -454,6 +455,19 @@ actual object PlayerSettingsStorage {
                     putString(key, language)
                 }
             }
+            ?.apply()
+    }
+
+    actual fun loadRememberSeriesTrackSelections(): Boolean? =
+        preferences?.let { sharedPreferences ->
+            val key = ProfileScopedKey.of(rememberSeriesTrackSelectionsKey)
+            if (sharedPreferences.contains(key)) sharedPreferences.getBoolean(key, true) else null
+        }
+
+    actual fun saveRememberSeriesTrackSelections(enabled: Boolean) {
+        preferences
+            ?.edit()
+            ?.putBoolean(ProfileScopedKey.of(rememberSeriesTrackSelectionsKey), enabled)
             ?.apply()
     }
 

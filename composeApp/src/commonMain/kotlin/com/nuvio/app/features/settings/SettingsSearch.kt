@@ -657,6 +657,11 @@ internal fun settingsSearchEntries(
         section = playbackSubtitleAudio,
         icon = Icons.Rounded.PlayArrow,
         rows = listOf(
+            PlaybackSearchRow(
+                "remember-series-tracks",
+                stringResource(Res.string.settings_playback_remember_series_tracks),
+                stringResource(Res.string.settings_playback_remember_series_tracks_description),
+            ),
             PlaybackSearchRow("preferred-audio", stringResource(Res.string.settings_playback_preferred_audio_language)),
             PlaybackSearchRow("secondary-audio", stringResource(Res.string.settings_playback_secondary_audio_language)),
             PlaybackSearchRow("preferred-subtitles", stringResource(Res.string.settings_playback_preferred_subtitle_language)),

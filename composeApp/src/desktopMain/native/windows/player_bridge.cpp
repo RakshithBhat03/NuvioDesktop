@@ -1835,6 +1835,9 @@ private:
         if (type == "selectAudioTrack") {
             selectAudioTrackId((int)std::llround(value));
             syncControls();
+            // Applied above so the switch is immediate, but the preference is only
+            // recorded on the Kotlin side, so the selection must also reach the sink.
+            sendPlayerEvent(type, value);
             return;
         }
         if (type == "selectSubtitleTrack") {

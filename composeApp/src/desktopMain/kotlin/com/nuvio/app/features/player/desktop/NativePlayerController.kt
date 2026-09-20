@@ -24,6 +24,7 @@ import com.nuvio.app.features.player.SubtitleOutlineColorSwatches
 import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
 import com.nuvio.app.features.player.inferForcedSubtitleTrack
+import com.nuvio.app.features.player.languageMatchesPreference
 import com.nuvio.app.features.player.toStorageHexString
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
@@ -968,13 +969,13 @@ internal class NativePlayerController(
         val preferredLanguages = languages
             .map(String::trim)
             .filter(String::isNotEmpty)
-            .map(String::lowercase)
         if (preferredLanguages.isEmpty()) return
+        // mpv reports container tags verbatim ("eng", "pt-BR"), so both sides go
+        // through the shared normalizer before comparison.
         val audioTracks = getAudioTracks()
-        for(preferred in preferredLanguages){
+        for (preferred in preferredLanguages) {
             val trackIndex = audioTracks.indexOfFirst { track ->
-                val language = track.language?.lowercase() ?: return@indexOfFirst false
-                language == preferred || language.startsWith("$preferred-")
+                languageMatchesPreference(track.language, preferred)
             }
             if (trackIndex >= 0) {
                 selectAudioTrack(trackIndex)

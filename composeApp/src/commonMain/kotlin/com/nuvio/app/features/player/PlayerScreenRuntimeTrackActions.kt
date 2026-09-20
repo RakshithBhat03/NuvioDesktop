@@ -6,6 +6,14 @@ internal val PlayerScreenRuntime.subtitleStyle: SubtitleStyleState
 private val PlayerScreenRuntime.subtitlePreferenceItemId: String
     get() = "${playbackSession.videoId}|${activeSeasonNumber ?: -1}|${activeEpisodeNumber ?: -1}"
 
+private val PlayerScreenRuntime.episodeTrackPreferenceId: String
+    get() = buildEpisodeTrackPreferenceId(
+        parentMetaId = parentMetaId,
+        videoId = playbackSession.videoId,
+        seasonNumber = activeSeasonNumber,
+        episodeNumber = activeEpisodeNumber,
+    )
+
 internal val PlayerScreenRuntime.activeAddonSubtitleType: String
     get() = contentType ?: parentMetaType
 
@@ -39,8 +47,20 @@ internal fun PlayerScreenRuntime.updateTrackPreference(
     update: (PersistedPlayerTrackPreference) -> PersistedPlayerTrackPreference,
 ) {
     if (parentMetaId.isBlank()) return
-    val current = PlayerTrackPreferenceStorage.load(parentMetaId) ?: PersistedPlayerTrackPreference()
-    PlayerTrackPreferenceStorage.save(parentMetaId, update(current))
+    val episodeCurrent = PlayerTrackPreferenceStorage.load(episodeTrackPreferenceId)
+        ?: (if (isSeries) null else PlayerTrackPreferenceStorage.load(parentMetaId))
+        ?: PersistedPlayerTrackPreference()
+    val episodeUpdated = update(episodeCurrent)
+    PlayerTrackPreferenceStorage.save(episodeTrackPreferenceId, episodeUpdated)
+
+    if (!isSeries) {
+        PlayerTrackPreferenceStorage.save(parentMetaId, episodeUpdated)
+        return
+    }
+    if (!playerSettingsUiState.rememberSeriesTrackSelections) return
+
+    val showCurrent = PlayerTrackPreferenceStorage.load(parentMetaId) ?: PersistedPlayerTrackPreference()
+    PlayerTrackPreferenceStorage.save(parentMetaId, update(showCurrent).asShowFallback())
 }
 
 internal fun PlayerScreenRuntime.persistAudioPreference(track: AudioTrack?) {
@@ -86,21 +106,63 @@ internal fun PlayerScreenRuntime.persistAddonSubtitlePreference(subtitle: AddonS
             addonSubtitleUrl = subtitle.url,
             addonSubtitleItemId = subtitlePreferenceItemId,
             addonSubtitleAddonName = subtitle.addonName,
-            subtitleIsForced = null,
+            subtitleIsForced = addonSubtitleIsForced(subtitle),
         )
     }
 }
 
 internal fun PlayerScreenRuntime.restorePersistedTrackPreferenceIfNeeded(): Boolean {
     if (trackPreferenceRestoreApplied) return true
-    val preference = PlayerTrackPreferenceStorage.load(parentMetaId)
-    if (preference == null) {
+    val episodePreference = PlayerTrackPreferenceStorage.load(episodeTrackPreferenceId)
+    val showPreference = when {
+        isSeries && playerSettingsUiState.rememberSeriesTrackSelections ->
+            PlayerTrackPreferenceStorage.load(parentMetaId)
+        !isSeries -> PlayerTrackPreferenceStorage.load(parentMetaId)
+        else -> null
+    }
+    val preferences = resolvePlayerTrackPreferences(episodePreference, showPreference)
+    if (preferences.audio.isEmpty() && preferences.subtitle.isEmpty()) {
         trackPreferenceRestoreApplied = true
         return true
     }
 
-    restorePersistedAudioPreference(preference)
+    val audioResolved = when {
+        preferences.audio.isEmpty() -> true
+        audioTracks.isEmpty() -> false
+        else -> {
+            preferences.audio.firstOrNull { preference ->
+                findPersistedAudioTrackIndex(audioTracks, preference) >= 0
+            }?.let(::restorePersistedAudioPreference)
+            true
+        }
+    }
+    val subtitleResolved = restorePersistedSubtitlePreferences(preferences.subtitle)
+    trackPreferenceRestoreApplied = audioResolved && subtitleResolved
+    return trackPreferenceRestoreApplied
+}
 
+private fun PlayerScreenRuntime.restorePersistedSubtitlePreferences(
+    preferences: List<PersistedPlayerTrackPreference>,
+): Boolean {
+    for (preference in preferences) {
+        when (restorePersistedSubtitlePreference(preference)) {
+            PersistedSubtitleRestoreResult.APPLIED -> return true
+            PersistedSubtitleRestoreResult.PENDING -> return false
+            PersistedSubtitleRestoreResult.NO_MATCH -> Unit
+        }
+    }
+    return true
+}
+
+private enum class PersistedSubtitleRestoreResult {
+    APPLIED,
+    PENDING,
+    NO_MATCH,
+}
+
+private fun PlayerScreenRuntime.restorePersistedSubtitlePreference(
+    preference: PersistedPlayerTrackPreference,
+): PersistedSubtitleRestoreResult {
     when (preference.subtitleType) {
         PersistedSubtitleSelectionType.DISABLED -> {
             playerController?.selectSubtitleTrack(-1)
@@ -109,22 +171,13 @@ internal fun PlayerScreenRuntime.restorePersistedTrackPreferenceIfNeeded(): Bool
             useCustomSubtitles = false
             preferredSubtitleSelectionApplied = true
             isUserExplicitSubtitleSelection = true
+            return PersistedSubtitleRestoreResult.APPLIED
         }
         PersistedSubtitleSelectionType.INTERNAL -> {
-            if (subtitleTracks.isNotEmpty()) {
-                val restoredSubtitleIndex = findPersistedSubtitleTrackIndex(subtitleTracks, preference)
-                if (restoredSubtitleIndex >= 0) {
-                    if (useCustomSubtitles) {
-                        playerController?.clearExternalSubtitleAndSelect(restoredSubtitleIndex)
-                    } else {
-                        playerController?.selectSubtitleTrack(restoredSubtitleIndex)
-                    }
-                    selectedSubtitleIndex = restoredSubtitleIndex
-                    selectedAddonSubtitleId = null
-                    useCustomSubtitles = false
-                    preferredSubtitleSelectionApplied = true
-                    isUserExplicitSubtitleSelection = true
-                }
+            val restoredSubtitleIndex = findPersistedSubtitleTrackIndex(subtitleTracks, preference)
+            if (restoredSubtitleIndex >= 0) {
+                selectPersistedInternalSubtitle(restoredSubtitleIndex)
+                return PersistedSubtitleRestoreResult.APPLIED
             }
         }
         PersistedSubtitleSelectionType.ADDON -> {
@@ -142,44 +195,81 @@ internal fun PlayerScreenRuntime.restorePersistedTrackPreferenceIfNeeded(): Bool
                     playerController?.setSubtitleUri(persistedUrl)
                     preferredSubtitleSelectionApplied = true
                     isUserExplicitSubtitleSelection = true
-                } else if (belongsToCurrentItem) {
-                    val fetchKey = addonSubtitleFetchKey.takeUnless {
-                        activeSourceUrl.startsWith("file:") && externalSubtitles.isNotEmpty()
-                    }
-                    if (fetchKey != null && autoFetchedAddonSubtitlesForKey != fetchKey) return false
+                    return PersistedSubtitleRestoreResult.APPLIED
+                }
 
-                    val subtitle = findPersistedAddonSubtitle(addonSubtitles, preference)
-                    val canRestoreWhileLoading = subtitle != null && (
-                        subtitle.url == preference.addonSubtitleUrl ||
-                            preference.addonSubtitleAddonName.isNullOrBlank() ||
-                            subtitle.addonName.equals(preference.addonSubtitleAddonName, ignoreCase = true)
-                        )
-                    if (isLoadingAddonSubtitles && !canRestoreWhileLoading) return false
-                    if (subtitle != null) {
-                        selectedAddonSubtitleId = subtitle.selectionKey
-                        selectedSubtitleIndex = -1
-                        useCustomSubtitles = true
-                        playerController?.setSubtitleUri(subtitle.url)
-                        preferredSubtitleSelectionApplied = true
-                        isUserExplicitSubtitleSelection = true
-                    } else {
-                        selectedAddonSubtitleId = null
-                        selectedSubtitleIndex = -1
-                        useCustomSubtitles = false
-                    }
-                } else {
-                    selectedAddonSubtitleId = null
-                    selectedSubtitleIndex = -1
-                    useCustomSubtitles = false
+                val fetchKey = addonSubtitleFetchKey.takeUnless {
+                    activeSourceUrl.startsWith("file:") && externalSubtitles.isNotEmpty()
+                }
+                if (fetchKey != null && autoFetchedAddonSubtitlesForKey != fetchKey) {
+                    return PersistedSubtitleRestoreResult.PENDING
+                }
+                val matchPreference = if (belongsToCurrentItem) preference else preference.copy(addonSubtitleUrl = null)
+                val subtitle = findPersistedAddonSubtitle(addonSubtitles, matchPreference)
+                val canRestoreWhileLoading = subtitle != null && (
+                    subtitle.url == preference.addonSubtitleUrl ||
+                        preference.addonSubtitleAddonName.isNullOrBlank() ||
+                        subtitle.addonName.equals(preference.addonSubtitleAddonName, ignoreCase = true)
+                    )
+                if (isLoadingAddonSubtitles && !canRestoreWhileLoading) {
+                    return PersistedSubtitleRestoreResult.PENDING
+                }
+                if (subtitle != null) {
+                    selectPersistedAddonSubtitle(subtitle)
+                    return PersistedSubtitleRestoreResult.APPLIED
                 }
             }
         }
+        else -> return PersistedSubtitleRestoreResult.NO_MATCH
     }
 
-    trackPreferenceRestoreApplied = audioTracks.isNotEmpty() ||
-        (preference.audioTrackId.isNullOrBlank() && preference.audioLanguage.isNullOrBlank() &&
-            preference.audioName.isNullOrBlank())
-    return true
+    if (isUserExplicitSubtitleSelection) return PersistedSubtitleRestoreResult.APPLIED
+    if (!hasScannedTextTracksOnce || hasPendingAddonSubtitleFetch()) {
+        return PersistedSubtitleRestoreResult.PENDING
+    }
+
+    if (preference.subtitleType != PersistedSubtitleSelectionType.ADDON) {
+        val addonMatch = findPersistedAddonSubtitle(addonSubtitles, preference)
+        if (addonMatch != null) {
+            selectPersistedAddonSubtitle(addonMatch)
+            return PersistedSubtitleRestoreResult.APPLIED
+        }
+    }
+
+    val internalMatch = findPersistedSubtitleTrackIndex(subtitleTracks, preference)
+    if (internalMatch >= 0) {
+        selectPersistedInternalSubtitle(internalMatch)
+        return PersistedSubtitleRestoreResult.APPLIED
+    }
+    return PersistedSubtitleRestoreResult.NO_MATCH
+}
+
+private fun PlayerScreenRuntime.selectPersistedAddonSubtitle(subtitle: AddonSubtitle) {
+    selectedAddonSubtitleId = subtitle.selectionKey
+    selectedSubtitleIndex = -1
+    useCustomSubtitles = true
+    playerController?.setSubtitleUri(subtitle.url)
+    preferredSubtitleSelectionApplied = true
+    isUserExplicitSubtitleSelection = true
+}
+
+private fun PlayerScreenRuntime.selectPersistedInternalSubtitle(index: Int) {
+    if (useCustomSubtitles) {
+        playerController?.clearExternalSubtitleAndSelect(index)
+    } else {
+        playerController?.selectSubtitleTrack(index)
+    }
+    selectedSubtitleIndex = index
+    selectedAddonSubtitleId = null
+    useCustomSubtitles = false
+    preferredSubtitleSelectionApplied = true
+    isUserExplicitSubtitleSelection = true
+}
+
+private fun PlayerScreenRuntime.hasPendingAddonSubtitleFetch(): Boolean {
+    if (activeSourceUrl.startsWith("file:") && externalSubtitles.isNotEmpty()) return false
+    val fetchKey = addonSubtitleFetchKey ?: return false
+    return autoFetchedAddonSubtitlesForKey != fetchKey || isLoadingAddonSubtitles
 }
 
 internal fun PlayerScreenRuntime.refreshTracks() {
@@ -205,7 +295,9 @@ internal fun PlayerScreenRuntime.refreshTracks() {
 
     applyPreferredAudioTrack(preferredAudioTargets)
 
-    if (subtitlePreferenceReady && (preferredAudioSelectionApplied || audioTracks.isEmpty())) {
+    if (subtitlePreferenceReady && trackPreferenceRestoreApplied &&
+        (preferredAudioSelectionApplied || audioTracks.isEmpty())
+    ) {
         tryAutoSelectPreferredSubtitleFromAvailableTracks(preferredAudioTargets)
     }
 }
