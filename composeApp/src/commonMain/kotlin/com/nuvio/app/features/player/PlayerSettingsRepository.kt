@@ -50,6 +50,7 @@ data class PlayerSettingsUiState(
     val secondaryPreferredAudioLanguage: String? = null,
     val preferredSubtitleLanguage: String = SubtitleLanguageOption.NONE,
     val secondaryPreferredSubtitleLanguage: String? = null,
+    val rememberSeriesTrackSelections: Boolean = true,
     val subtitleStyle: SubtitleStyleState = SubtitleStyleState.DEFAULT,
     val streamReuseLastLinkEnabled: Boolean = false,
     val streamReuseLastLinkCacheHours: Int = 24,
@@ -133,6 +134,7 @@ object PlayerSettingsRepository {
     private var secondaryPreferredAudioLanguage: String? = null
     private var preferredSubtitleLanguage = SubtitleLanguageOption.NONE
     private var secondaryPreferredSubtitleLanguage: String? = null
+    private var rememberSeriesTrackSelections = true
     private var subtitleStyle = SubtitleStyleState.DEFAULT
     private var streamReuseLastLinkEnabled = false
     private var streamReuseLastLinkCacheHours = 24
@@ -221,6 +223,7 @@ object PlayerSettingsRepository {
         secondaryPreferredAudioLanguage = null
         preferredSubtitleLanguage = SubtitleLanguageOption.NONE
         secondaryPreferredSubtitleLanguage = null
+        rememberSeriesTrackSelections = true
         subtitleStyle = SubtitleStyleState.DEFAULT
         streamReuseLastLinkEnabled = false
         streamReuseLastLinkCacheHours = 24
@@ -320,6 +323,7 @@ object PlayerSettingsRepository {
                 ?: SubtitleLanguageOption.NONE
         secondaryPreferredSubtitleLanguage =
             normalizeLanguageCode(PlayerSettingsStorage.loadSecondaryPreferredSubtitleLanguage())
+        rememberSeriesTrackSelections = PlayerSettingsStorage.loadRememberSeriesTrackSelections() ?: true
         subtitleStyle = SubtitleStyleState(
             textColor = subtitleColorFromStorage(PlayerSettingsStorage.loadSubtitleTextColor())
                 ?: SubtitleStyleState.DEFAULT.textColor,
@@ -611,6 +615,14 @@ object PlayerSettingsRepository {
         secondaryPreferredSubtitleLanguage = normalized
         publish()
         PlayerSettingsStorage.saveSecondaryPreferredSubtitleLanguage(normalized)
+    }
+
+    fun setRememberSeriesTrackSelections(enabled: Boolean) {
+        ensureLoaded()
+        if (rememberSeriesTrackSelections == enabled) return
+        rememberSeriesTrackSelections = enabled
+        publish()
+        PlayerSettingsStorage.saveRememberSeriesTrackSelections(enabled)
     }
 
     fun setSubtitleStyle(style: SubtitleStyleState) {
@@ -1198,6 +1210,7 @@ object PlayerSettingsRepository {
             secondaryPreferredAudioLanguage = secondaryPreferredAudioLanguage,
             preferredSubtitleLanguage = preferredSubtitleLanguage,
             secondaryPreferredSubtitleLanguage = secondaryPreferredSubtitleLanguage,
+            rememberSeriesTrackSelections = rememberSeriesTrackSelections,
             subtitleStyle = subtitleStyle,
             streamReuseLastLinkEnabled = streamReuseLastLinkEnabled,
             streamReuseLastLinkCacheHours = streamReuseLastLinkCacheHours,
