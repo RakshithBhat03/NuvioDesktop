@@ -502,23 +502,6 @@ internal fun findPersistedAudioTrackIndex(
     }?.index ?: languageCandidates.firstOrNull()?.index ?: -1
 }
 
-internal fun findPersistedAddonSubtitle(
-    subtitles: List<AddonSubtitle>,
-    preference: PersistedPlayerTrackPreference,
-): AddonSubtitle? {
-    preference.addonSubtitleUrl?.takeIf { it.isNotBlank() }?.let { url ->
-        subtitles.firstOrNull { it.url == url }?.let { return it }
-    }
-    val language = preference.subtitleLanguage?.takeIf { it.isNotBlank() } ?: return null
-    val candidates = subtitles.filter { addonSubtitleMatchesLanguage(it, language) }
-    val providerCandidates = preference.addonSubtitleAddonName?.takeIf { it.isNotBlank() }?.let { name ->
-        candidates.filter { it.addonName.equals(name, ignoreCase = true) }
-    }.orEmpty()
-    val preferredCandidates = providerCandidates.ifEmpty { candidates }
-    return preferredCandidates.firstOrNull {
-        it.display.equals(preference.subtitleName, ignoreCase = true)
-    } ?: preferredCandidates.firstOrNull()
-}
 
 internal fun findPersistedSubtitleTrackIndex(
     tracks: List<SubtitleTrack>,
@@ -566,6 +549,49 @@ internal fun findPersistedSubtitleTrackIndex(
         forcedNameMatches.firstOrNull()?.let { return it.index }
     }
     return -1
+}
+
+internal fun findPersistedAddonSubtitle(
+    subtitles: List<AddonSubtitle>,
+    preference: PersistedPlayerTrackPreference,
+): AddonSubtitle? {
+    preference.addonSubtitleUrl?.takeIf { it.isNotBlank() }?.let { url ->
+        subtitles.firstOrNull { it.url == url }?.let { return it }
+    }
+    val targetLanguage = preference.subtitleLanguage?.takeIf { it.isNotBlank() } ?: return null
+    val languageMatches = subtitles.filter { subtitle ->
+        SubtitleLanguageMatching.matchesLanguageCode(subtitle.language, targetLanguage)
+    }
+    if (languageMatches.isEmpty()) return null
+
+    val forcedMatches = preference.subtitleIsForced?.let { forced ->
+        languageMatches.filter { addonSubtitleIsForced(it) == forced }
+            .takeIf { it.isNotEmpty() }
+    } ?: languageMatches
+    val addonMatches = preference.addonSubtitleAddonName?.takeIf { it.isNotBlank() }?.let { addonName ->
+        forcedMatches.filter { it.addonName.equals(addonName, ignoreCase = true) }
+            .takeIf { it.isNotEmpty() }
+    } ?: forcedMatches
+
+    preference.subtitleName?.takeIf { it.isNotBlank() }?.let { name ->
+        addonMatches.firstOrNull { it.display.equals(name, ignoreCase = true) }
+            ?.let { return it }
+        forcedMatches.firstOrNull { it.display.equals(name, ignoreCase = true) }
+            ?.let { return it }
+    }
+
+    val targetVariant = SubtitleLanguageMatching.detectTrackLanguageVariant(
+        language = preference.subtitleLanguage,
+        name = preference.subtitleName,
+        trackId = preference.subtitleTrackId,
+    )
+    return addonMatches.firstOrNull { subtitle ->
+        SubtitleLanguageMatching.detectTrackLanguageVariant(
+            language = subtitle.language,
+            name = subtitle.display,
+            trackId = subtitle.id,
+        ) == targetVariant
+    } ?: addonMatches.first()
 }
 
 internal fun persistedAddonSubtitleUrlForItem(

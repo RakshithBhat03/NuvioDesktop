@@ -2743,6 +2743,9 @@ static void nuvioMpvWakeup(void *ctx) {
     if ([type isEqualToString:@"selectAudioTrack"] && value) {
         [self selectAudioTrackId:(int)llround(value.doubleValue)];
         [self syncControls];
+        // Applied above so the switch is immediate, but the preference is only
+        // recorded on the Kotlin side, so the selection must also reach the sink.
+        [self sendPlayerEvent:type value:value.doubleValue];
         return;
     }
     if ([type isEqualToString:@"selectSubtitleTrack"] && value) {
