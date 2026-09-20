@@ -363,6 +363,88 @@ class PlayerTrackSelectionTest {
         assertNull(persistedAddonSubtitleUrlForItem(preference, "series|1|2"))
     }
 
+    @Test
+    fun episodePreferenceIsTriedBeforeShowFallback() {
+        val episode = PersistedPlayerTrackPreference(
+            audioLanguage = "fr",
+            audioTrackId = "episode-audio",
+        )
+        val show = PersistedPlayerTrackPreference(
+            audioLanguage = "en",
+            subtitleType = PersistedSubtitleSelectionType.INTERNAL,
+            subtitleLanguage = "en",
+        )
+
+        val resolved = resolvePlayerTrackPreferences(episode, show)
+
+        assertEquals(listOf(episode, show), resolved.audio)
+        assertEquals(listOf(show), resolved.subtitle)
+    }
+
+    @Test
+    fun showFallbackKeepsLanguagesButDropsEpisodeIdentifiers() {
+        val fallback = PersistedPlayerTrackPreference(
+            audioLanguage = "en",
+            audioName = "English 5.1",
+            audioTrackId = "2",
+            subtitleType = PersistedSubtitleSelectionType.ADDON,
+            subtitleLanguage = "en",
+            subtitleTrackId = "4",
+            addonSubtitleId = "episode-1",
+            addonSubtitleUrl = "https://example.com/episode-1.srt",
+            addonSubtitleItemId = "series|1|1",
+            addonSubtitleAddonName = "Subtitle Addon",
+        ).asShowFallback()
+
+        assertEquals("en", fallback.audioLanguage)
+        assertEquals("English 5.1", fallback.audioName)
+        assertNull(fallback.audioTrackId)
+        assertEquals("en", fallback.subtitleLanguage)
+        assertNull(fallback.subtitleTrackId)
+        assertNull(fallback.addonSubtitleId)
+        assertNull(fallback.addonSubtitleUrl)
+        assertNull(fallback.addonSubtitleItemId)
+        assertEquals("Subtitle Addon", fallback.addonSubtitleAddonName)
+    }
+
+    @Test
+    fun rememberedAddonLanguageSelectsSubtitleForTheNewEpisode() {
+        val preferred = AddonSubtitle(
+            id = "episode-2-english",
+            url = "https://example.com/episode-2-english.srt",
+            language = "en",
+            display = "English",
+            addonName = "Preferred Addon",
+        )
+        val fallback = AddonSubtitle(
+            id = "episode-2-english-alt",
+            url = "https://example.com/episode-2-english-alt.srt",
+            language = "en",
+            display = "English alternate",
+            addonName = "Other Addon",
+        )
+
+        val selected = findPersistedAddonSubtitle(
+            subtitles = listOf(fallback, preferred),
+            preference = PersistedPlayerTrackPreference(
+                subtitleType = PersistedSubtitleSelectionType.ADDON,
+                subtitleLanguage = "en",
+                addonSubtitleAddonName = "Preferred Addon",
+            ),
+        )
+
+        assertEquals(preferred, selected)
+    }
+
+    @Test
+    fun episodePreferenceKeySeparatesEpisodes() {
+        val first = buildEpisodeTrackPreferenceId("tt123", "tt123:1:1", 1, 1)
+        val second = buildEpisodeTrackPreferenceId("tt123", "tt123:1:2", 1, 2)
+
+        assertEquals("episode|tt123|tt123:1:1|1|1", first)
+        assertEquals(false, first == second)
+    }
+
     private fun audioTrack(language: String?) = AudioTrack(
         index = 0,
         id = "audio-0",
