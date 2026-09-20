@@ -32,6 +32,15 @@ internal fun PlaybackAudioSettings(
             isTablet = isTablet,
         ) {
             SettingsGroup(isTablet = isTablet) {
+                SettingsSwitchRow(
+                    title = stringResource(Res.string.settings_playback_remember_series_tracks),
+                    description = stringResource(Res.string.settings_playback_remember_series_tracks_description),
+                    checked = settings.rememberSeriesTrackSelections,
+                    enabled = !settings.externalPlayerEnabled,
+                    isTablet = isTablet,
+                    onCheckedChange = PlayerSettingsRepository::setRememberSeriesTrackSelections,
+                )
+                SettingsGroupDivider(isTablet = isTablet)
                 SettingsNavigationRow(
                     title = stringResource(Res.string.settings_playback_preferred_audio_language),
                     description = when (settings.preferredAudioLanguage) {

@@ -50,6 +50,7 @@ internal actual object PlayerSettingsStorage {
     private const val secondaryPreferredAudioLanguageKey = "secondary_preferred_audio_language"
     private const val preferredSubtitleLanguageKey = "preferred_subtitle_language"
     private const val secondaryPreferredSubtitleLanguageKey = "secondary_preferred_subtitle_language"
+    private const val rememberSeriesTrackSelectionsKey = "remember_series_track_selections"
     private const val subtitleTextColorKey = "subtitle_text_color"
     private const val subtitleAppearanceKey = "subtitle_appearance"
     private const val subtitleBackgroundColorKey = "subtitle_background_color"
@@ -131,6 +132,7 @@ internal actual object PlayerSettingsStorage {
         secondaryPreferredAudioLanguageKey,
         preferredSubtitleLanguageKey,
         secondaryPreferredSubtitleLanguageKey,
+        rememberSeriesTrackSelectionsKey,
         subtitleTextColorKey,
         subtitleAppearanceKey,
         subtitleBackgroundColorKey,
@@ -275,6 +277,9 @@ internal actual object PlayerSettingsStorage {
     actual fun savePreferredSubtitleLanguage(language: String) = saveString(preferredSubtitleLanguageKey, language)
     actual fun loadSecondaryPreferredSubtitleLanguage(): String? = loadString(secondaryPreferredSubtitleLanguageKey)
     actual fun saveSecondaryPreferredSubtitleLanguage(language: String?) = saveOptionalString(secondaryPreferredSubtitleLanguageKey, language)
+    actual fun loadRememberSeriesTrackSelections(): Boolean? = loadBoolean(rememberSeriesTrackSelectionsKey)
+    actual fun saveRememberSeriesTrackSelections(enabled: Boolean) =
+        saveBoolean(rememberSeriesTrackSelectionsKey, enabled)
     actual fun loadSubtitleTextColor(): String? = loadString(subtitleTextColorKey)
     actual fun saveSubtitleTextColor(colorHex: String) = saveString(subtitleTextColorKey, colorHex)
     actual fun loadSubtitleAppearance(): String? = loadString(subtitleAppearanceKey)
@@ -436,6 +441,7 @@ internal actual object PlayerSettingsStorage {
         loadSecondaryPreferredAudioLanguage()?.let { put(secondaryPreferredAudioLanguageKey, encodeSyncString(it)) }
         loadPreferredSubtitleLanguage()?.let { put(preferredSubtitleLanguageKey, encodeSyncString(it)) }
         loadSecondaryPreferredSubtitleLanguage()?.let { put(secondaryPreferredSubtitleLanguageKey, encodeSyncString(it)) }
+        loadRememberSeriesTrackSelections()?.let { put(rememberSeriesTrackSelectionsKey, encodeSyncBoolean(it)) }
         loadSubtitleTextColor()?.let { put(subtitleTextColorKey, encodeSyncString(it)) }
         loadSubtitleAppearance()?.let { put(subtitleAppearanceKey, encodeSyncString(it)) }
         loadSubtitleBackgroundColor()?.let { put(subtitleBackgroundColorKey, encodeSyncString(it)) }
@@ -524,6 +530,7 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncString(secondaryPreferredAudioLanguageKey)?.let(::saveSecondaryPreferredAudioLanguage)
         payload.decodeSyncString(preferredSubtitleLanguageKey)?.let(::savePreferredSubtitleLanguage)
         payload.decodeSyncString(secondaryPreferredSubtitleLanguageKey)?.let(::saveSecondaryPreferredSubtitleLanguage)
+        payload.decodeSyncBoolean(rememberSeriesTrackSelectionsKey)?.let(::saveRememberSeriesTrackSelections)
         payload.decodeSyncString(subtitleTextColorKey)?.let(::saveSubtitleTextColor)
         payload.decodeSyncString(subtitleAppearanceKey)?.let(::saveSubtitleAppearance)
         payload.decodeSyncString(subtitleBackgroundColorKey)?.let(::saveSubtitleBackgroundColor)
