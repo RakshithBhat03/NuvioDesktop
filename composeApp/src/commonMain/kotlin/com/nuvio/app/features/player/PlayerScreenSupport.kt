@@ -3,10 +3,18 @@ package com.nuvio.app.features.player
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.features.details.MetaVideo
 import com.nuvio.app.features.streams.StreamItem
+import com.nuvio.app.isDesktop
 
 internal const val PlaybackProgressPersistIntervalMs = 60_000L
 internal const val PlayerDoubleTapSeekStepMs = 10_000L
 internal const val PlayerDoubleTapSeekResetDelayMs = 800L
+
+/** Keyboard and control-button seek step, matching the desktop player UI and native media keys. */
+internal const val PlayerMobileSeekStepMs = 10_000L
+internal const val PlayerDesktopSeekStepMs = 5_000L
+internal val PlayerSeekStepMs: Long
+    get() = if (isDesktop) PlayerDesktopSeekStepMs else PlayerMobileSeekStepMs
+
 internal const val PlayerLockedOverlayDurationMs = 2_000L
 internal const val PlayerLeftGestureBoundary = 0.4f
 internal const val PlayerRightGestureBoundary = 0.6f

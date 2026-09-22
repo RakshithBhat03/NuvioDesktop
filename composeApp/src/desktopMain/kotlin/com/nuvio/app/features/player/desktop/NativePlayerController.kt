@@ -20,6 +20,7 @@ import com.nuvio.app.features.player.PlayerMediaInfo
 import com.nuvio.app.features.player.mpvMediaInfo
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
+import com.nuvio.app.features.player.PlayerSeekStepMs
 import com.nuvio.app.features.player.SUBTITLE_DELAY_MAX_MS
 import com.nuvio.app.features.player.findPreferredAudioTrackIndex
 import com.nuvio.app.features.player.SUBTITLE_DELAY_MIN_MS
@@ -608,9 +609,9 @@ internal class NativePlayerController(
                 }
             }
             PlayerControlsAction.SeekBack,
-            PlayerControlsAction.KeyboardSeekBack -> fallbackSeekBy(-10_000L)
+            PlayerControlsAction.KeyboardSeekBack -> fallbackSeekBy(-PlayerSeekStepMs)
             PlayerControlsAction.SeekForward,
-            PlayerControlsAction.KeyboardSeekForward -> fallbackSeekBy(10_000L)
+            PlayerControlsAction.KeyboardSeekForward -> fallbackSeekBy(PlayerSeekStepMs)
             PlayerControlsAction.KeyboardVolumeDown -> adjustFallbackVolume(-10f)
             PlayerControlsAction.KeyboardVolumeUp -> adjustFallbackVolume(10f)
             PlayerControlsAction.PictureInPicture -> togglePictureInPictureFromShortcut()
