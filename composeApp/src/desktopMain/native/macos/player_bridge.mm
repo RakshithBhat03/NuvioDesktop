@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <clocale>
 #include <cmath>
 #include <cstring>
 #include <dlfcn.h>
@@ -1511,6 +1512,10 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
               playWhenReady:(BOOL)playWhenReady
            initialPositionMs:(long long)initialPositionMs
             decoderPriority:(int)decoderPriority {
+    // libmpv requires LC_NUMERIC=C (a locale with comma decimals makes
+    // mpv_create fail); the JVM uses java.util.Locale, so this C-level
+    // change does not affect Java number formatting.
+    setlocale(LC_NUMERIC, "C");
     _mpv = mpv_create();
     if (!_mpv) {
         @throw [NSException exceptionWithName:@"PlayerBridgeError"
