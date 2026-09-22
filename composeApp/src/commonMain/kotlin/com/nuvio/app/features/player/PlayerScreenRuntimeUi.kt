@@ -687,8 +687,8 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
             },
             partyActive = partyActive,
             onTogglePlayback = { togglePlayback() },
-            onSeekBack = { seekBy(-10_000L) },
-            onSeekForward = { seekBy(10_000L) },
+            onSeekBack = { seekBy(-PlayerSeekStepMs) },
+            onSeekForward = { seekBy(PlayerSeekStepMs) },
             onResizeModeClick = { cycleResizeMode() },
             onSpeedClick = { cyclePlaybackSpeed() },
             onSubtitleClick = {
@@ -862,19 +862,19 @@ private fun PlayerScreenRuntime.handlePlayerControlsAction(action: PlayerControl
             return false
         }
         PlayerControlsAction.SeekBack -> {
-            prepareSeekByForNativeFallback(-10_000L)
+            prepareSeekByForNativeFallback(-PlayerSeekStepMs)
             return false
         }
         PlayerControlsAction.KeyboardSeekBack -> {
-            prepareSeekByForNativeFallback(-10_000L, revealControls = false)
+            prepareSeekByForNativeFallback(-PlayerSeekStepMs, revealControls = false)
             return false
         }
         PlayerControlsAction.SeekForward -> {
-            prepareSeekByForNativeFallback(10_000L)
+            prepareSeekByForNativeFallback(PlayerSeekStepMs)
             return false
         }
         PlayerControlsAction.KeyboardSeekForward -> {
-            prepareSeekByForNativeFallback(10_000L, revealControls = false)
+            prepareSeekByForNativeFallback(PlayerSeekStepMs, revealControls = false)
             return false
         }
         PlayerControlsAction.KeyboardVolumeDown,
