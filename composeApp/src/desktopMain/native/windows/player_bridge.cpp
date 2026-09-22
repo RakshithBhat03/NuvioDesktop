@@ -16,6 +16,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cctype>
+#include <clocale>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -1750,6 +1751,10 @@ private:
         bool fastProfile = !nvidiaRtxSuperResolutionEnabled && unifiedMemoryGpu();
         {
             std::lock_guard<std::mutex> lock(mpvMutex);
+            // libmpv requires LC_NUMERIC=C (a locale with comma decimals makes
+            // mpv_create fail); the JVM uses java.util.Locale, so this C-level
+            // change does not affect Java number formatting.
+            setlocale(LC_NUMERIC, "C");
             mpv = api.create();
             if (!mpv) {
                 throw std::runtime_error("mpv_create failed.");
