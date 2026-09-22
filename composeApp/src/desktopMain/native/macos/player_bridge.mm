@@ -47,6 +47,8 @@
 #endif
 
 static constexpr double kMaxVolumePercent = 200.0;
+// Standalone media-key seek step, used only when no Kotlin event sink forwards the key press.
+static constexpr long long kMediaKeySeekStepMs = 5 * 1000;
 // mpv exposes cached seekable spans, not the last cached packet. The two differ
 // by the tail of a GOP, and only the spans can be seeked without a source read.
 static constexpr double kCachedRangeEpsilon = 0.05;
@@ -2812,10 +2814,10 @@ static void nuvioMpvWakeup(void *ctx) {
         [self setPaused:![self isPaused]];
         [self syncControls];
     } else if ([type isEqualToString:@"keyboardSeekForward"]) {
-        [self seekByMilliseconds:10 * 1000];
+        [self seekByMilliseconds:kMediaKeySeekStepMs];
         [self syncControls];
     } else if ([type isEqualToString:@"keyboardSeekBack"]) {
-        [self seekByMilliseconds:-10 * 1000];
+        [self seekByMilliseconds:-kMediaKeySeekStepMs];
         [self syncControls];
     }
 }

@@ -584,9 +584,12 @@ const syncVolumeControl = () => {
   }
 };
 
+// Must match PlayerSeekStepMs in the desktop player controller.
+const seekStepSeconds = 5;
+
 const seekToastLabel = command => {
-  if (command === "seekBack" || command === "keyboardSeekBack") return "-10s";
-  if (command === "seekForward" || command === "keyboardSeekForward") return "+10s";
+  if (command === "seekBack" || command === "keyboardSeekBack") return `-${seekStepSeconds}s`;
+  if (command === "seekForward" || command === "keyboardSeekForward") return `+${seekStepSeconds}s`;
   if (command === "pictureInPicture" || command === "pip") return state.pipLabel || "";
   return "";
 };
