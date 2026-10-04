@@ -1,5 +1,8 @@
 const root = document.getElementById("playerRoot");
 const seek = document.getElementById("seek");
+const seekPreview = document.getElementById("seekPreview");
+const seekPreviewImage = document.getElementById("seekPreviewImage");
+const seekPreviewTime = document.getElementById("seekPreviewTime");
 const positionLabel = document.getElementById("position");
 const durationLabel = document.getElementById("duration");
 const timeLabel = document.getElementById("timeLabel");
@@ -819,7 +822,7 @@ const setProgress = (positionMs, durationMs) => {
   const bufferedPercent = durationMs > 0
     ? Math.max(percent, Math.min(100, bufferedMs / durationMs * 100))
     : percent;
-  seek.value = Math.round(percent * 10);
+  seek.value = Math.round(percent / 100 * Number(seek.max));
   seek.style.setProperty("--progress", `${percent}%`);
   seek.style.setProperty("--buffered", `${bufferedPercent}%`);
   positionLabel.textContent = formatTime(positionMs);
@@ -1039,7 +1042,7 @@ const playbackErrorText = () => String(state.playbackErrorMessage || "").trim();
 
 const rangePositionMs = () => {
   const durationMs = Math.max(0, Number(state.durationMs) || 0);
-  return durationMs > 0 ? Math.round(durationMs * Number(seek.value) / 1000) : 0;
+  return durationMs > 0 ? Math.round(durationMs * Number(seek.value) / Number(seek.max)) : 0;
 };
 
 const modalByName = {
@@ -3189,21 +3192,326 @@ nextEpisodeCard.addEventListener("click", event => {
   }
 });
 
-seek.addEventListener("input", () => {
-  noteChromeActivity();
-  isScrubbing = true;
-  scrubPositionMs = rangePositionMs();
-  setProgress(scrubPositionMs, state.durationMs);
+const seekPreviewCache = new Map();
+const seekPreviewRetryAfter = new Map();
+const seekPreviewIntervalMs = 5000;
+// Large enough to hold every 5-second bucket of a long film, so frames for
+// regions seen earlier stay available after the playback cache moves on.
+const seekPreviewCacheLimit = 2000;
+const seekPreviewNearbyMs = 10000;
+const seekPreviewRequestGapMs = 120;
+const seekPreviewSameBucketRetryMs = 4000;
+const seekPreviewFailureRetryMs = 3000;
+// Matches --seek-thumb-size on .scrub; read once instead of forcing style
+// recalculation on every pointer move.
+const seekThumbWidth = 10;
+const scrubChangeIntervalMs = 200;
+let seekPreviewEnabled = false;
+// Every span (ms) the player has reported as cached this session. Previews
+// are generated only inside these spans and stay available after the
+// playback cache evicts them.
+let seekPreviewCachedSpans = [];
+let seekPreviewBucketMs = null;
+let seekPreviewPointerInside = false;
+let seekPreviewTimer = 0;
+let seekPreviewLastRequestAt = -Infinity;
+let seekPreviewLastRequestedBucketMs = null;
+let seekPreviewShownImage = "";
+let seekPreviewClientX = null;
+let seekFrame = 0;
+let scrubChangeTimer = 0;
+let scrubChangeSentAt = -Infinity;
+
+const seekPreviewPositionFromClientX = (clientX, rect) => {
+  if (rect.width <= seekThumbWidth) return rangePositionMs();
+  const fraction = Math.max(0, Math.min(1,
+    (clientX - rect.left - seekThumbWidth / 2) / (rect.width - seekThumbWidth),
+  ));
+  // Match the native range control's integer steps as well as its thumb inset.
+  const rangeValue = Math.round(fraction * Number(seek.max));
+  return Math.round(rangeValue * state.durationMs / Number(seek.max));
+};
+
+const rememberSeekPreviewCachedSpans = (ranges, fullyCached, durationMs) => {
+  const incoming = fullyCached && durationMs > 0
+    ? [[0, durationMs]]
+    : (Array.isArray(ranges) ? ranges : []).map(range => [
+      Math.max(0, Math.floor(range[0] * 1000)),
+      Math.ceil(range[1] * 1000),
+    ]);
+  if (!incoming.length) return;
+  const spans = seekPreviewCachedSpans.concat(incoming).sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const span of spans) {
+    const last = merged[merged.length - 1];
+    if (last && span[0] <= last[1]) {
+      last[1] = Math.max(last[1], span[1]);
+    } else {
+      merged.push([span[0], span[1]]);
+    }
+  }
+  seekPreviewCachedSpans = merged;
+};
+
+// Local files are read from disk without a demuxer cache, so the whole
+// timeline is available to the preview worker.
+// The default state says "not a network stream" before native has reported,
+// so only an explicit report counts.
+let seekPreviewSourceIsLocal = false;
+const seekPreviewWholeFileReadable = () =>
+  Boolean(state.fullyCached) || seekPreviewSourceIsLocal;
+
+const seekPreviewCachedSpanAt = positionMs =>
+  seekPreviewCachedSpans.find(span => positionMs >= span[0] && positionMs <= span[1]) || null;
+
+// Buckets are clamped into the cached span so edge positions still map to a
+// frame the preview worker can read from cached data.
+const seekPreviewBucketFor = positionMs => {
+  const span = seekPreviewCachedSpanAt(positionMs);
+  if (!span) return null;
+  const bucketMs = Math.round(positionMs / seekPreviewIntervalMs) * seekPreviewIntervalMs;
+  const lastFrameMs = Math.max(0, (Number(state.durationMs) || 0) - 500);
+  const spanEndMs = Math.min(span[1], lastFrameMs);
+  if (spanEndMs < span[0]) return null;
+  return Math.max(span[0], Math.min(spanEndMs, bucketMs));
+};
+
+// While the exact bucket loads, a nearby frame keeps the card from
+// collapsing to time-only and flickering.
+const seekPreviewImageFor = bucketMs => {
+  const exact = seekPreviewCache.get(bucketMs);
+  if (exact) return { image: exact, exact: true };
+  for (let offset = seekPreviewIntervalMs; offset <= seekPreviewNearbyMs; offset += seekPreviewIntervalMs) {
+    const nearby = seekPreviewCache.get(bucketMs - offset) || seekPreviewCache.get(bucketMs + offset);
+    if (nearby) return { image: nearby, exact: false };
+  }
+  return { image: "", exact: false };
+};
+
+const applySeekPreviewImage = bucketMs => {
+  const { image, exact } = seekPreviewImageFor(bucketMs);
+  seekPreview.classList.toggle("has-image", Boolean(image));
+  seekPreviewImage.hidden = !image;
+  if (image && image !== seekPreviewShownImage) seekPreviewImage.src = image;
+  seekPreviewShownImage = image;
+  return exact;
+};
+
+const positionSeekPreview = (rectWidth, x) => {
+  const halfWidth = Math.min(
+    seekPreview.classList.contains("has-image") ? 88 : 32,
+    Math.max(0, (rectWidth - 8) / 2),
+  );
+  const left = Math.max(halfWidth, Math.min(rectWidth - halfWidth, x));
+  seekPreview.style.transform = `translate3d(${left}px, 0, 0) translateX(-50%)`;
+};
+
+const requestSeekPreview = () => {
+  seekPreviewTimer = 0;
+  const bucketMs = seekPreviewBucketMs;
+  if (seekPreview.hidden || bucketMs === null || seekPreviewCache.has(bucketMs)) return;
+  const elapsedMs = performance.now() - seekPreviewLastRequestAt;
+  const delay = Math.max(
+    0,
+    (seekPreviewRetryAfter.get(bucketMs) || 0) - Date.now(),
+    seekPreviewRequestGapMs - elapsedMs,
+    seekPreviewLastRequestedBucketMs === bucketMs ? seekPreviewSameBucketRetryMs - elapsedMs : 0,
+  );
+  if (delay > 0) {
+    seekPreviewTimer = window.setTimeout(requestSeekPreview, Math.ceil(delay));
+    return;
+  }
+  seekPreviewLastRequestAt = performance.now();
+  seekPreviewWarmedAt = seekPreviewLastRequestAt;
+  seekPreviewLastRequestedBucketMs = bucketMs;
+  send("seekPreview", bucketMs);
+  // Re-ask if no answer arrives, so a stationary hover cannot stall forever.
+  seekPreviewTimer = window.setTimeout(requestSeekPreview, seekPreviewSameBucketRetryMs);
+};
+
+// Opening the stream in the preview player takes seconds. Keeping it open
+// while the controls are visible lets the first hover answer immediately;
+// the native worker closes it after 45 seconds without requests.
+const seekPreviewWarmIntervalMs = 30000;
+let seekPreviewWarmedAt = -Infinity;
+const warmSeekPreview = () => {
+  if (!seekPreviewEnabled || !seekPreview.hidden || !state.controlsVisible || !(state.durationMs > 0)) return;
+  if (performance.now() - seekPreviewWarmedAt < seekPreviewWarmIntervalMs) return;
+  const bucketMs = seekPreviewBucketFor(Math.max(0, Number(state.positionMs) || 0));
+  if (bucketMs === null) return;
+  seekPreviewWarmedAt = performance.now();
+  send("seekPreview", bucketMs);
+};
+
+const scheduleSeekPreview = () => {
+  if (seekPreviewTimer || seekPreviewBucketMs === null) return;
+  requestSeekPreview();
+};
+
+// The macOS arm64 bridge enables previews after the controls page is ready.
+window.enablePlayerSeekPreview = () => {
+  seekPreviewEnabled = true;
+  seekPreviewCache.clear();
+  seekPreviewRetryAfter.clear();
+  seekPreviewCachedSpans = [];
+  rememberSeekPreviewCachedSpans(state.cachedRanges, seekPreviewWholeFileReadable(), Number(state.durationMs) || 0);
+};
+
+window.playerSeekPreview = ({ positionMs, imageUrl }) => {
+  if (!seekPreviewEnabled || !Number.isFinite(positionMs)) return;
+  if (imageUrl) {
+    seekPreviewRetryAfter.delete(positionMs);
+    seekPreviewCache.delete(positionMs);
+    seekPreviewCache.set(positionMs, imageUrl);
+    if (seekPreviewCache.size > seekPreviewCacheLimit) {
+      seekPreviewCache.delete(seekPreviewCache.keys().next().value);
+    }
+  } else if (!seekPreviewCache.has(positionMs)) {
+    seekPreviewRetryAfter.set(positionMs, Date.now() + seekPreviewFailureRetryMs);
+    if (seekPreviewRetryAfter.size > seekPreviewCacheLimit) {
+      seekPreviewRetryAfter.delete(seekPreviewRetryAfter.keys().next().value);
+    }
+  }
+  if (seekPreview.hidden || seekPreviewBucketMs === null) return;
+  // The native worker answers with its latest target, which may not be the
+  // bucket under the pointer now; keep asking until the current one lands.
+  if (!applySeekPreviewImage(seekPreviewBucketMs)) {
+    if (seekPreviewLastRequestedBucketMs !== seekPreviewBucketMs) {
+      window.clearTimeout(seekPreviewTimer);
+      seekPreviewTimer = 0;
+    }
+    scheduleSeekPreview();
+  }
+  scheduleSeekFrame();
+};
+
+const hideSeekPreview = () => {
+  window.clearTimeout(seekPreviewTimer);
+  seekPreviewTimer = 0;
+  window.cancelAnimationFrame(seekFrame);
+  seekFrame = 0;
+  seekPreview.hidden = true;
+  seekPreviewBucketMs = null;
+  seekPreviewClientX = null;
+};
+
+const showSeekPreview = (positionMs, rect) => {
+  if (!seekPreviewEnabled || !Number.isFinite(positionMs) || state.durationMs <= 0) return;
+  const bucketMs = seekPreviewBucketFor(positionMs);
+  if (bucketMs !== seekPreviewBucketMs) {
+    seekPreviewBucketMs = bucketMs;
+    window.clearTimeout(seekPreviewTimer);
+    seekPreviewTimer = 0;
+  }
+  // Outside cached data the card shows only the time.
+  const exact = bucketMs === null ? true : applySeekPreviewImage(bucketMs);
+  if (bucketMs === null) {
+    seekPreview.classList.remove("has-image");
+    seekPreviewImage.hidden = true;
+    seekPreviewShownImage = "";
+  }
+  positionSeekPreview(
+    rect.width,
+    seekThumbWidth / 2 + (rect.width - seekThumbWidth) * positionMs / state.durationMs,
+  );
+  seekPreviewTime.textContent = formatTime(positionMs);
+  seekPreview.hidden = false;
+  if (!exact) scheduleSeekPreview();
+};
+
+// Pointer moves and range input can fire well above the display rate; doing
+// layout reads, DOM writes, and bridge messages once per frame keeps the
+// seek bar responsive.
+const renderSeekFrame = () => {
+  seekFrame = 0;
+  const rect = seek.getBoundingClientRect();
+  if (isScrubbing) {
+    showSeekPreview(scrubPositionMs, rect);
+    setProgress(scrubPositionMs, state.durationMs);
+  } else if (seekPreviewPointerInside && seekPreviewClientX !== null) {
+    showSeekPreview(seekPreviewPositionFromClientX(seekPreviewClientX, rect), rect);
+  }
+};
+
+function scheduleSeekFrame() {
+  if (!seekFrame) seekFrame = window.requestAnimationFrame(renderSeekFrame);
+}
+
+// Kotlin only needs to know a scrub is active and roughly where; each
+// message re-renders the full controls state, so it is throttled.
+const flushScrubChange = () => {
+  window.clearTimeout(scrubChangeTimer);
+  scrubChangeTimer = 0;
+  scrubChangeSentAt = performance.now();
   send("scrubChange", scrubPositionMs);
+};
+
+const queueScrubChange = () => {
+  if (scrubChangeTimer) return;
+  const waitMs = scrubChangeIntervalMs - (performance.now() - scrubChangeSentAt);
+  if (waitMs <= 0) {
+    flushScrubChange();
+  } else {
+    scrubChangeTimer = window.setTimeout(flushScrubChange, Math.ceil(waitMs));
+  }
+};
+
+seek.addEventListener("pointerenter", event => {
+  seekPreviewPointerInside = true;
+  seekPreviewClientX = event.clientX;
+  scheduleSeekFrame();
 });
 
-seek.addEventListener("change", () => {
-  noteChromeActivity();
+seek.addEventListener("pointermove", event => {
+  seekPreviewPointerInside = true;
+  seekPreviewClientX = event.clientX;
+  scheduleSeekFrame();
+});
+
+seek.addEventListener("pointerleave", () => {
+  seekPreviewPointerInside = false;
+  if (!isScrubbing) hideSeekPreview();
+});
+
+// A cancelled drag or lost focus may never fire "change"; commit the scrub so
+// Kotlin and the controls do not stay in the scrubbing state.
+const finishScrub = () => {
+  window.clearTimeout(scrubChangeTimer);
+  scrubChangeTimer = 0;
+  scrubChangeSentAt = -Infinity;
+  window.cancelAnimationFrame(seekFrame);
+  seekFrame = 0;
   scrubPositionMs = rangePositionMs();
   isScrubbing = false;
   send("scrubFinish", scrubPositionMs);
   state.positionMs = scrubPositionMs;
   render();
+};
+
+seek.addEventListener("pointercancel", () => {
+  seekPreviewPointerInside = false;
+  if (isScrubbing) finishScrub();
+  hideSeekPreview();
+});
+
+window.addEventListener("blur", () => {
+  seekPreviewPointerInside = false;
+  if (isScrubbing) finishScrub();
+  hideSeekPreview();
+});
+
+seek.addEventListener("input", () => {
+  noteChromeActivity();
+  isScrubbing = true;
+  scrubPositionMs = rangePositionMs();
+  queueScrubChange();
+  scheduleSeekFrame();
+});
+
+seek.addEventListener("change", () => {
+  noteChromeActivity();
+  finishScrub();
+  if (!seekPreviewPointerInside) hideSeekPreview();
 });
 
 volumeSlider.addEventListener("input", event => {
@@ -3282,6 +3590,11 @@ window.playerUpdate = update => {
     audioTracks,
     subtitleTracks,
   };
+  if (update.networkStream != null) seekPreviewSourceIsLocal = !update.networkStream;
+  rememberSeekPreviewCachedSpans(state.cachedRanges, seekPreviewWholeFileReadable(), durationMs);
+  warmSeekPreview();
+  // A hover that was outside cached data may be inside it now.
+  if (!seekPreview.hidden || isScrubbing) scheduleSeekFrame();
   if (!appliedRememberedVolume) {
     appliedRememberedVolume = true;
     syncVolumeControl();

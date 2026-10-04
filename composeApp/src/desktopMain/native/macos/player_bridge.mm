@@ -207,6 +207,9 @@ static bool nuvioCachedRangesCoverContinuously(
                                useLibass:(BOOL)useLibass
                                 stripSdh:(BOOL)stripSdh;
 - (void)handleScriptMessage:(NSDictionary *)message;
+#if defined(__aarch64__)
+- (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs imageUrl:(NSString *)imageUrl;
+#endif
 - (void)startMpvEventDrain;
 - (void)applyVolumeSplit:(double)percent;
 - (void)scheduleMpvEventDrain;
@@ -1121,6 +1124,268 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     mpv_set_option_string(mpv, name, value);
 }
 
+#if defined(__aarch64__)
+// A separate, muted libmpv handle keeps preview seeks away from the playing handle.
+// It is created only after a seek-bar hover and released after inactivity.
+@interface SeekPreviewWorker : NSObject
+- (instancetype)initWithSource:(NSString *)source
+                   headerLines:(NSArray<NSString *> *)headerLines
+                        player:(MpvWebPlayer *)player;
+- (void)requestPositionMs:(long long)positionMs;
+- (void)shutdown;
+@end
+
+@implementation SeekPreviewWorker {
+    NSString *_source;
+    NSArray<NSString *> *_headerLines;
+    __weak MpvWebPlayer *_player;
+    dispatch_queue_t _queue;
+    mpv_handle *_mpv;
+    BOOL _loaded;
+    NSTimeInterval _retryLoadAfter;
+    std::atomic_bool _stopped;
+    std::atomic<uint64_t> _requestSerial;
+    std::atomic<long long> _latestPositionMs;
+}
+
+- (instancetype)initWithSource:(NSString *)source
+                   headerLines:(NSArray<NSString *> *)headerLines
+                        player:(MpvWebPlayer *)player {
+    self = [super init];
+    if (!self) return nil;
+    _source = [source copy];
+    _headerLines = [headerLines copy];
+    _player = player;
+    _queue = dispatch_queue_create("com.nuvio.desktop.seek-preview", DISPATCH_QUEUE_SERIAL);
+    _stopped.store(false);
+    _requestSerial.store(0);
+    _latestPositionMs.store(0);
+    return self;
+}
+
+- (void)destroyMpv {
+    if (_mpv) {
+        mpv_terminate_destroy(_mpv);
+        _mpv = NULL;
+    }
+    _loaded = NO;
+}
+
+- (BOOL)failLoad {
+    [self destroyMpv];
+    // A short cooldown avoids hammering a failing source without leaving
+    // previews dead for the rest of the hover.
+    _retryLoadAfter = [NSDate timeIntervalSinceReferenceDate] + 3.0;
+    return NO;
+}
+
+- (BOOL)waitForEvent:(mpv_event_id)target timeout:(double)timeout {
+    NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + timeout;
+    while (!_stopped.load() && [NSDate timeIntervalSinceReferenceDate] < deadline) {
+        mpv_event *event = mpv_wait_event(_mpv, 0.1);
+        if (event->event_id == target) return YES;
+        if (event->event_id == MPV_EVENT_END_FILE || event->event_id == MPV_EVENT_SHUTDOWN) return NO;
+    }
+    return NO;
+}
+
+- (BOOL)waitForLoadedFrameWithTimeout:(double)timeout {
+    NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + timeout;
+    BOOL fileLoaded = NO;
+    BOOL frameReady = NO;
+    while (!_stopped.load() && [NSDate timeIntervalSinceReferenceDate] < deadline) {
+        mpv_event *event = mpv_wait_event(_mpv, 0.1);
+        if (event->event_id == MPV_EVENT_FILE_LOADED) fileLoaded = YES;
+        if (event->event_id == MPV_EVENT_PLAYBACK_RESTART) frameReady = YES;
+        if (fileLoaded && frameReady) return YES;
+        if (event->event_id == MPV_EVENT_END_FILE || event->event_id == MPV_EVENT_SHUTDOWN) return NO;
+    }
+    return NO;
+}
+
+- (BOOL)loadAtPositionMs:(long long)positionMs {
+    if (_loaded) return YES;
+    if ([NSDate timeIntervalSinceReferenceDate] < _retryLoadAfter) return NO;
+    if (_mpv) [self destroyMpv];
+    _mpv = mpv_create();
+    if (!_mpv) return [self failLoad];
+    setMpvOptionString(_mpv, "config", "no");
+    setMpvOptionString(_mpv, "osc", "no");
+    setMpvOptionString(_mpv, "vo", "null");
+    setMpvOptionString(_mpv, "ao", "null");
+    setMpvOptionString(_mpv, "audio", "no");
+    // Copy-back hardware decoding keeps 4K/HEVC previews fast; libmpv falls
+    // back to software when VideoToolbox cannot open the stream.
+    setMpvOptionString(_mpv, "hwdec", "auto-copy");
+    setMpvOptionString(_mpv, "vd-lavc-threads", "2");
+    setMpvOptionString(_mpv, "vd-lavc-fast", "yes");
+    setMpvOptionString(_mpv, "vd-lavc-skiploopfilter", "all");
+    // Keyframe seeks avoid decoding up to a whole GOP per preview; a frame
+    // within a few seconds of the 5-second bucket is accurate enough.
+    setMpvOptionString(_mpv, "hr-seek", "no");
+    setMpvOptionString(_mpv, "sid", "no");
+    setMpvOptionString(_mpv, "sub-auto", "no");
+    setMpvOptionString(_mpv, "audio-file-auto", "no");
+    setMpvOptionString(_mpv, "load-scripts", "no");
+    setMpvOptionString(_mpv, "ytdl", "no");
+    setMpvOptionString(_mpv, "vf", "scale=320:-2");
+    setMpvOptionString(_mpv, "pause", "yes");
+    setMpvOptionString(_mpv, "keep-open", "yes");
+    setMpvOptionString(_mpv, "demuxer-max-bytes", "8MiB");
+    setMpvOptionString(_mpv, "demuxer-max-back-bytes", "0");
+    setMpvOptionString(_mpv, "demuxer-subtitle-cache-bytes", "0");
+    setMpvOptionString(_mpv, "demuxer-audio-cache-bytes", "0");
+    setMpvOptionString(_mpv, "cache-secs", "2");
+    if (_headerLines.count > 0) {
+        NSMutableArray<NSString *> *escaped = [NSMutableArray arrayWithCapacity:_headerLines.count];
+        for (NSString *line in _headerLines) {
+            NSString *value = [[line stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"]
+                               stringByReplacingOccurrencesOfString:@"," withString:@"\\,"];
+            [escaped addObject:value];
+        }
+        setMpvOptionString(_mpv, "http-header-fields", [escaped componentsJoinedByString:@","].UTF8String);
+    }
+    if (mpv_initialize(_mpv) < 0) {
+        return [self failLoad];
+    }
+    NSString *start = [NSString stringWithFormat:@"start=%.3f", positionMs / 1000.0];
+    const char *load[] = {"loadfile", _source.UTF8String, "replace", "-1", start.UTF8String, NULL};
+    if (mpv_command(_mpv, load) < 0) {
+        return [self failLoad];
+    }
+    if (![self waitForLoadedFrameWithTimeout:15.0]) {
+        return [self failLoad];
+    }
+    int seekable = 0;
+    if (mpv_get_property(_mpv, "seekable", MPV_FORMAT_FLAG, &seekable) < 0 || !seekable) {
+        return [self failLoad];
+    }
+    // Software screenshots do not tone-map, so PQ/HLG frames come out with
+    // lifted, washed mid-tones. Map them to SDR in the filter chain instead;
+    // reference white (203 nits) stays near SDR white and highlights roll off.
+    char *gamma = mpv_get_property_string(_mpv, "video-params/gamma");
+    BOOL hdr = gamma && (!strcmp(gamma, "pq") || !strcmp(gamma, "hlg"));
+    mpv_free(gamma);
+    if (hdr) {
+        mpv_set_property_string(_mpv, "vf",
+            "scale=320:-2,zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=709,"
+            "tonemap=tonemap=mobius:param=0.7:peak=5:desat=0,"
+            "zscale=t=709:m=709:r=tv,format=yuv420p");
+        NSString *seconds = [NSString stringWithFormat:@"%.3f", positionMs / 1000.0];
+        const char *seek[] = {"seek", seconds.UTF8String, "absolute+keyframes", NULL};
+        if (mpv_command(_mpv, seek) < 0 || ![self waitForEvent:MPV_EVENT_PLAYBACK_RESTART timeout:12.0]) {
+            return [self failLoad];
+        }
+    }
+    _loaded = YES;
+    return YES;
+}
+
+- (NSString *)captureAtPositionMs:(long long *)positionMs serial:(uint64_t)serial {
+    BOOL wasLoaded = _loaded;
+    long long loadPositionMs = *positionMs;
+    if (![self loadAtPositionMs:*positionMs]) return nil;
+    if (_stopped.load()) return nil;
+    if (serial != 0) *positionMs = _latestPositionMs.load();
+    // Loading already produced a frame at the initial target. Seek only if
+    // this handle was loaded earlier or the pointer moved while loading.
+    if (wasLoaded || *positionMs != loadPositionMs) {
+        NSString *seconds = [NSString stringWithFormat:@"%.3f", *positionMs / 1000.0];
+        const char *seek[] = {"seek", seconds.UTF8String, "absolute+keyframes", NULL};
+        if (mpv_command(_mpv, seek) < 0) {
+            [self failLoad];
+            return nil;
+        }
+        if (![self waitForEvent:MPV_EVENT_PLAYBACK_RESTART timeout:12.0]) {
+            [self failLoad];
+            return nil;
+        }
+    }
+    if (_stopped.load()) return nil;
+    const char *shot[] = {"screenshot-raw", "video", NULL};
+    mpv_node result = {};
+    if (mpv_command_ret(_mpv, shot, &result) < 0) {
+        return nil;
+    }
+    NSString *imageUrl = nil;
+    if (result.format == MPV_FORMAT_NODE_MAP) {
+        int64_t width = 0, height = 0, stride = 0;
+        const char *format = NULL;
+        mpv_byte_array *pixels = NULL;
+        for (int index = 0; index < result.u.list->num; index++) {
+            const char *key = result.u.list->keys[index];
+            mpv_node *value = &result.u.list->values[index];
+            if (!strcmp(key, "w") && value->format == MPV_FORMAT_INT64) width = value->u.int64;
+            if (!strcmp(key, "h") && value->format == MPV_FORMAT_INT64) height = value->u.int64;
+            if (!strcmp(key, "stride") && value->format == MPV_FORMAT_INT64) stride = value->u.int64;
+            if (!strcmp(key, "format") && value->format == MPV_FORMAT_STRING) format = value->u.string;
+            if (!strcmp(key, "data") && value->format == MPV_FORMAT_BYTE_ARRAY) pixels = value->u.ba;
+        }
+        if (width > 0 && width <= 2048 && height > 0 && height <= 2048 &&
+            stride >= width * 4 && pixels && format && !strcmp(format, "bgr0") &&
+            pixels->size >= (size_t)(stride * height)) {
+            NSBitmapImageRep *bitmap = [[NSBitmapImageRep alloc]
+                initWithBitmapDataPlanes:NULL pixelsWide:width pixelsHigh:height
+                bitsPerSample:8 samplesPerPixel:3 hasAlpha:NO isPlanar:NO
+                colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:width * 3 bitsPerPixel:24];
+            unsigned char *destination = bitmap.bitmapData;
+            const unsigned char *source = (const unsigned char *)pixels->data;
+            if (destination) {
+                for (int64_t y = 0; y < height; y++) {
+                    const unsigned char *row = source + y * stride;
+                    unsigned char *out = destination + y * width * 3;
+                    for (int64_t x = 0; x < width; x++) {
+                        out[x * 3] = row[x * 4 + 2];
+                        out[x * 3 + 1] = row[x * 4 + 1];
+                        out[x * 3 + 2] = row[x * 4];
+                    }
+                }
+                NSData *jpeg = [bitmap representationUsingType:NSBitmapImageFileTypeJPEG
+                                                     properties:@{NSImageCompressionFactor: @0.72}];
+                if (jpeg.length > 0) {
+                    imageUrl = [@"data:image/jpeg;base64," stringByAppendingString:
+                        [jpeg base64EncodedStringWithOptions:0]];
+                }
+            }
+        }
+    }
+    mpv_free_node_contents(&result);
+    return imageUrl;
+}
+
+- (void)requestPositionMs:(long long)positionMs {
+    if (_stopped.load()) return;
+    _latestPositionMs.store(positionMs);
+    uint64_t serial = _requestSerial.fetch_add(1) + 1;
+    dispatch_async(_queue, ^{
+        @autoreleasepool {
+            if (self->_stopped.load() || self->_requestSerial.load() != serial) return;
+            long long capturedPositionMs = positionMs;
+            NSString *imageUrl = [self captureAtPositionMs:&capturedPositionMs serial:serial];
+            if (self->_stopped.load()) return;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                MpvWebPlayer *player = self->_player;
+                if (player && !self->_stopped.load()) {
+                    [player handleSeekPreviewResultAtPositionMs:capturedPositionMs imageUrl:imageUrl];
+                }
+            });
+            // Keep the opened stream around between hovers so returning to the
+            // seek bar does not pay for a fresh network open and probe.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_SEC), self->_queue, ^{
+                if (self->_requestSerial.load() == serial) [self destroyMpv];
+            });
+        }
+    });
+}
+
+- (void)shutdown {
+    _stopped.store(true);
+    _player = nil;
+    dispatch_async(_queue, ^{ [self destroyMpv]; });
+}
+@end
+#endif
+
 @implementation MpvWebPlayer {
     NSView *_hostView;
     PlayerMetalView *_videoView;
@@ -1169,6 +1434,10 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     BOOL _fullscreenTransitionActive;
     NSString *_pendingControlsJson;
     NSString *_sourceUrl;
+#if defined(__aarch64__)
+    NSArray<NSString *> *_previewHeaderLines;
+    SeekPreviewWorker *_previewWorker;
+#endif
     BOOL _controlsSyncInFlight;
     NSRect _lastAppliedNativeLayoutBounds;
     BOOL _lastAppliedNativeLayoutWasLiveResize;
@@ -1760,6 +2029,9 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                                      userInfo:nil];
     }
     _sourceUrl = [sourceUrl copy];
+#if defined(__aarch64__)
+    _previewHeaderLines = [headerLines copy];
+#endif
 
     setMpvOptionString(_mpv, "config", "no");
     setMpvOptionString(_mpv, "osc", "no");
@@ -2121,6 +2393,10 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
 }
 
 - (void)shutdown {
+#if defined(__aarch64__)
+    [_previewWorker shutdown];
+    _previewWorker = nil;
+#endif
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [_timer invalidate];
     _timer = nil;
@@ -2957,10 +3233,31 @@ static void nuvioMpvWakeup(void *ctx) {
     NSNumber *value = [rawValue isKindOfClass:[NSNumber class]] ? rawValue : nil;
     if ([type isEqualToString:@"controlsReady"]) {
         _controlsWebReady = YES;
+#if defined(__aarch64__)
+        [_webView evaluateJavaScript:@"window.enablePlayerSeekPreview()" completionHandler:nil];
+#endif
         [self flushPendingControlsJsonIfReady];
         [self syncControls];
         return;
     }
+#if defined(__aarch64__)
+    if ([type isEqualToString:@"seekPreview"] && value && _sourceUrl.length > 0 && _webView) {
+        long long positionMs = llround(value.doubleValue);
+        long long durationMs = [self durationMs];
+        if (durationMs > 0 && positionMs >= 0 && positionMs <= durationMs) {
+            if (!_previewWorker) {
+                _previewWorker = [[SeekPreviewWorker alloc] initWithSource:_sourceUrl
+                                                               headerLines:_previewHeaderLines
+                                                                    player:self];
+            }
+            [_previewWorker requestPositionMs:positionMs];
+        } else {
+            // Answer explicitly so the controls can retry instead of waiting.
+            [self handleSeekPreviewResultAtPositionMs:positionMs imageUrl:nil];
+        }
+        return;
+    }
+#endif
     if ([type isEqualToString:@"selectSubtitleTrack"] && value) {
         [self selectSubtitleTrackId:(int)llround(value.doubleValue)];
         [self syncControls];
@@ -3009,6 +3306,18 @@ static void nuvioMpvWakeup(void *ctx) {
         [self seekToMilliseconds:(long long)llround(value.doubleValue)];
     }
 }
+
+#if defined(__aarch64__)
+- (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs imageUrl:(NSString *)imageUrl {
+    if (!_webView || !_controlsWebReady) return;
+    NSString *encodedImage = imageUrl
+        ? [NSString stringWithFormat:@"\"%@\"", imageUrl]
+        : @"null";
+    NSString *script = [NSString stringWithFormat:
+        @"window.playerSeekPreview({positionMs:%lld,imageUrl:%@})", positionMs, encodedImage];
+    [_webView evaluateJavaScript:script completionHandler:nil];
+}
+#endif
 
 - (NSEvent *)handleMediaKeyEvent:(NSEvent *)event {
     if (event.type != NSEventTypeSystemDefined || event.subtype != NX_SUBTYPE_AUX_CONTROL_BUTTONS) {

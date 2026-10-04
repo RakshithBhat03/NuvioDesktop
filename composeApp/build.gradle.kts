@@ -943,6 +943,23 @@ val prepareMacosPlayerRuntime = tasks.register<Sync>("prepareMacosPlayerRuntime"
         include("*.dylib")
     }
     into(macosPlayerRuntimeOutput)
+    // Capture a plain File so the action does not reference the build script,
+    // which the configuration cache cannot serialize.
+    val runtimeDir = bundledMacosLibmpvRuntimeDir
+    doFirst {
+        val libraries = runtimeDir.listFiles { file ->
+            file.isFile && file.extension == "dylib"
+        }.orEmpty()
+        check(libraries.isNotEmpty()) {
+            "No macOS player runtime libraries found in $runtimeDir"
+        }
+        libraries.forEach { library ->
+            val magic = library.inputStream().use { it.readNBytes(4) }
+            check(magic.contentEquals(byteArrayOf(0xcf.toByte(), 0xfa.toByte(), 0xed.toByte(), 0xfe.toByte()))) {
+                "Invalid macOS player runtime library: $library. Materialize Git LFS files before packaging."
+            }
+        }
+    }
 }
 
 val prepareMacosPlayerAppResources = tasks.register<Sync>("prepareMacosPlayerAppResources") {

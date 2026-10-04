@@ -1557,7 +1557,57 @@ button:disabled {
   flex-direction: column;
 }
 
+.seek-wrap {
+  position: relative;
+  width: 100%;
+}
+
+.seek-preview {
+  position: absolute;
+  bottom: 24px;
+  left: 0;
+  z-index: 4;
+  min-width: 64px;
+  max-width: calc(100vw - 32px);
+  overflow: hidden;
+  transform: translateX(-50%);
+  will-change: transform;
+  border: 1px solid rgba(255, 255, 255, .25);
+  border-radius: 8px;
+  background: rgba(15, 16, 21, .94);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+  pointer-events: none;
+  text-align: center;
+}
+
+.seek-preview.has-image {
+  width: 176px;
+}
+
+.seek-preview[hidden],
+.seek-preview img[hidden] {
+  display: none;
+}
+
+.seek-preview img {
+  display: block;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  object-fit: contain;
+  background: #08090c;
+}
+
+.seek-preview span {
+  display: block;
+  padding: 5px 8px;
+  color: #fff;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
 .scrub {
+  --seek-thumb-size: 10px;
   width: 100%;
   height: 10px;
   display: block;
@@ -1583,7 +1633,7 @@ button:disabled {
 
 .scrub::-webkit-slider-thumb {
   appearance: none;
-  width: 10px;
+  width: var(--seek-thumb-size);
   height: 10px;
   margin-top: 0;
   border-radius: 999px;
