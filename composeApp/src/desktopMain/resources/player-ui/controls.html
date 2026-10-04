@@ -211,7 +211,13 @@
             <span class="provider" id="providerName"></span>
           </div>
         </section>
-        <input id="seek" class="scrub" type="range" min="0" max="1000" value="0" aria-label="Seek">
+        <div class="seek-wrap">
+          <div id="seekPreview" class="seek-preview" hidden aria-hidden="true">
+            <img id="seekPreviewImage" alt="" decoding="async" hidden>
+            <span id="seekPreviewTime"></span>
+          </div>
+          <input id="seek" class="scrub" type="range" min="0" max="10000" value="0" aria-label="Seek">
+        </div>
         <div class="time-row">
           <span class="time-pill" id="position">00:00</span>
           <span class="time-pill" id="duration">00:00</span>
