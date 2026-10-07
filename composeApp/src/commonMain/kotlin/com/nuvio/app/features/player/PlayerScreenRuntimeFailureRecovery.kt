@@ -13,6 +13,7 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.player_recovery_placeholder_rejected
 import nuvio.composeapp.generated.resources.player_recovery_retrying
 import nuvio.composeapp.generated.resources.player_recovery_switching_source
 import org.jetbrains.compose.resources.getString
@@ -39,6 +40,9 @@ internal class PlayerFailureRecoveryState {
     val attemptedSourceKeys = mutableSetOf<String>()
     var retryResumePositionMs = 0L
     var job: Job? = null
+
+    /** Source and video the placeholder check already ran for, so it runs once per source. */
+    var placeholderCheckedFor: String? = null
 
     fun scopeTo(titleKey: String, sourceKey: String) {
         if (this.titleKey != titleKey) {
@@ -118,7 +122,7 @@ internal fun PlayerScreenRuntime.tryRecoverFromPlaybackError(message: String?): 
             true
         }
         PlayerRecoveryAction.FailOver -> {
-            startSourceFailover(message, markSourceDead = decision.markSourceDead)
+            startSourceFailover(markSourceDead = decision.markSourceDead) { message }
             true
         }
     }
@@ -131,6 +135,43 @@ internal fun PlayerScreenRuntime.noteRecoveryPlaybackProgress(snapshot: PlayerPl
     if (snapshot.positionMs - state.retryResumePositionMs >= StableProgressResetMs) {
         state.retryCount = 0
     }
+}
+
+/**
+ * Pauses and replaces a source whose file is an error card instead of the title. Runs once
+ * per source, on the first snapshot that knows the duration, so the clip is neither played
+ * out nor counted as watched. Returns true when the source was rejected.
+ */
+internal fun PlayerScreenRuntime.rejectPlaceholderSourceIfNeeded(snapshot: PlayerPlaybackSnapshot): Boolean {
+    val controller = recoveryController ?: return false
+    if (snapshot.isLoading || snapshot.durationMs <= 0L) return false
+    if (activeSourceUrl.startsWith("file:", ignoreCase = true)) return false
+    val state = failureRecovery
+    val checkKey = "$activePlaybackIdentity|${activeVideoId.orEmpty()}"
+    if (state.placeholderCheckedFor == checkKey) return false
+    state.placeholderCheckedFor = checkKey
+
+    val expectedRuntimeMs = PlaceholderStreamPolicy.expectedRuntimeMs(
+        episodeRuntimeMinutes = playerMetaVideos.firstOrNull { it.id == activeVideoId }?.runtime,
+        titleRuntime = (metaUiState.meta ?: playerMeta)?.runtime,
+    )
+    if (!PlaceholderStreamPolicy.isPlaceholder(snapshot.durationMs, expectedRuntimeMs)) return false
+
+    log.w { "rejecting placeholder source: duration=${snapshot.durationMs}ms expected=${expectedRuntimeMs}ms" }
+    controller.pause()
+    state.scopeTo(recoveryTitleKey, activePlaybackIdentity)
+    val decision = decidePlayerRecovery(
+        failure = PlayerPlaybackFailure(PlayerPlaybackFailureKind.NothingToPlay),
+        retriesUsed = state.retryCount,
+        failoversUsed = state.failoverCount,
+    )
+    val rejectedMessage: suspend () -> String = { getString(Res.string.player_recovery_placeholder_rejected) }
+    if (decision.action == PlayerRecoveryAction.FailOver) {
+        startSourceFailover(markSourceDead = true, failureMessage = rejectedMessage)
+    } else {
+        scope.launch { showPlaybackError(rejectedMessage()) }
+    }
+    return true
 }
 
 private fun PlayerScreenRuntime.startSameSourceRetry(controller: PlayerEngineController, message: String) {
@@ -153,7 +194,10 @@ private fun PlayerScreenRuntime.startSameSourceRetry(controller: PlayerEngineCon
     }
 }
 
-private fun PlayerScreenRuntime.startSourceFailover(message: String, markSourceDead: Boolean) {
+private fun PlayerScreenRuntime.startSourceFailover(
+    markSourceDead: Boolean,
+    failureMessage: suspend () -> String,
+) {
     val state = failureRecovery
     val failedKey = activeSourceIdentityKey
     if (failedKey != null) {
@@ -165,7 +209,7 @@ private fun PlayerScreenRuntime.startSourceFailover(message: String, markSourceD
     val resumeMs = recoveryResumePositionMs()
     state.job = scope.launch {
         val handled = failOverToNextSource(sourceKey = sourceKey, failedUrl = failedUrl, resumeMs = resumeMs)
-        if (!handled) showPlaybackError(message)
+        if (!handled) showPlaybackError(failureMessage())
     }
 }
 

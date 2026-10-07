@@ -545,6 +545,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                     if (!updatePlaybackSnapshot(snapshot)) return@PlatformPlayerSurface
                     refreshAudioTracksIfChanged()
                     noteRecoveryPlaybackProgress(snapshot)
+                    rejectPlaceholderSourceIfNeeded(snapshot)
                     if (!snapshot.isLoading) initialLoadCompleted = true
                     if (snapshot.isEnded) {
                         shouldPlay = false
