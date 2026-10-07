@@ -2,6 +2,7 @@
 #import <IOKit/IOKitLib.h>
 #import <IOKit/hidsystem/ev_keymap.h>
 #import <MediaPlayer/MediaPlayer.h>
+#include <mach/mach.h>
 #define GL_SILENCE_DEPRECATION
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl3.h>
@@ -1970,6 +1971,7 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
     NSString *_previewIndexScript;
 #endif
     BOOL _controlsSyncInFlight;
+    std::atomic_bool _statsHudVisible;
     NSRect _lastAppliedNativeLayoutBounds;
     BOOL _lastAppliedNativeLayoutWasLiveResize;
     NSTimeInterval _lightweightResizeSettleUntil;
@@ -2720,6 +2722,8 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
             NSString *mediaTitle = [self stringProperty:"media-title" fallback:@""];
             NSString *gamma = [[self stringProperty:"video-params/gamma" fallback:@""] lowercaseString];
             NSString *primaries = [[self stringProperty:"video-params/primaries" fallback:@""] lowercaseString];
+            // Extra property reads only happen while the stats HUD is open.
+            NSString *statsJson = _statsHudVisible.load() ? [self statsHudJson] : nil;
             [self updateCachedDuration:duration
                               position:position
                             cacheAhead:cacheAhead
@@ -2776,7 +2780,7 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
                         networkStream ? @"true" : @"false"]
                     : @"cachedRanges:null,downloadSpeed:null,fullyCached:null,networkStream:null";
                 NSString *script = [NSString stringWithFormat:
-                    @"window.playerUpdate({duration:%0.3f,position:%0.3f,buffered:%0.3f,%@,volumeLevel:%0.3f,paused:%@,loading:%@,audioTracks:%@,subtitleTracks:%@})",
+                    @"window.playerUpdate({duration:%0.3f,position:%0.3f,buffered:%0.3f,%@,volumeLevel:%0.3f,paused:%@,loading:%@,audioTracks:%@,subtitleTracks:%@%@})",
                     duration,
                     position,
                     buffered,
@@ -2785,7 +2789,8 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
                     paused ? @"true" : @"false",
                     loading ? @"true" : @"false",
                     audioTracks,
-                    subtitleTracks];
+                    subtitleTracks,
+                    statsJson ? [@",stats:" stringByAppendingString:statsJson] : @""];
                 [self->_webView evaluateJavaScript:script completionHandler:nil];
             });
         }
@@ -2891,6 +2896,87 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
     return fmax(_previewHoldUntil.load() - [NSDate timeIntervalSinceReferenceDate], 0.0);
 }
 #endif
+
+/* Snapshot of mpv playback diagnostics for the stats HUD. Unavailable values
+ * are omitted so the overlay can hide them. JSON serialization handles string
+ * escaping and the result is a valid JS object literal. */
+- (NSString *)statsHudJson {
+    if (!_mpv) {
+        return nil;
+    }
+    NSMutableDictionary<NSString *, id> *stats = [NSMutableDictionary dictionary];
+    auto addString = ^(NSString *key, const char *prop) {
+        NSString *value = [self stringProperty:prop fallback:@""];
+        if (value.length > 0) stats[key] = value;
+    };
+    auto addDouble = ^(NSString *key, const char *prop) {
+        double value = [self doubleProperty:prop fallback:NAN];
+        if (std::isfinite(value)) stats[key] = @(value);
+    };
+    auto addInt = ^(NSString *key, const char *prop) {
+        long long value = [self int64Property:prop fallback:-1];
+        if (value >= 0) stats[key] = @(value);
+    };
+    addString(@"videoCodec", "video-codec");
+    addString(@"videoFormat", "video-format");
+    addInt(@"width", "video-params/w");
+    addInt(@"height", "video-params/h");
+    addInt(@"displayWidth", "width");
+    addInt(@"displayHeight", "height");
+    addDouble(@"containerFps", "container-fps");
+    addDouble(@"estimatedFps", "estimated-vf-fps");
+    addString(@"pixelFormat", "video-params/pixelformat");
+    addString(@"hwPixelFormat", "hw-pixelformat");
+    addString(@"gamma", "video-params/gamma");
+    addString(@"primaries", "video-params/primaries");
+    addString(@"colorMatrix", "video-params/colormatrix");
+    addDouble(@"sigPeak", "video-params/sig-peak");
+    addString(@"hwdec", "hwdec-current");
+    addDouble(@"videoBitrate", "video-bitrate");
+    addDouble(@"audioBitrate", "audio-bitrate");
+    addString(@"audioCodec", "audio-codec-name");
+    addInt(@"audioChannels", "audio-params/channel-count");
+    addInt(@"audioSampleRate", "audio-params/samplerate");
+    addString(@"audioOutput", "current-ao");
+    addInt(@"droppedFrames", "frame-drop-count");
+    addInt(@"decoderDroppedFrames", "decoder-frame-drop-count");
+    addInt(@"delayedFrames", "vo-delayed-frame-count");
+    addDouble(@"avsync", "avsync");
+    addDouble(@"cacheDuration", "demuxer-cache-duration");
+    addInt(@"fileSize", "file-size");
+    addString(@"fileFormat", "file-format");
+
+    mpv_node cache = {0};
+    if (mpv_get_property(_mpv, "demuxer-cache-state", MPV_FORMAT_NODE, &cache) >= 0) {
+        if (cache.format == MPV_FORMAT_NODE_MAP && cache.u.list) {
+            for (int i = 0; i < cache.u.list->num; i++) {
+                const char *key = cache.u.list->keys[i];
+                mpv_node *value = &cache.u.list->values[i];
+                if (value->format != MPV_FORMAT_INT64) continue;
+                if (std::strcmp(key, "fwd-bytes") == 0) {
+                    stats[@"cacheForwardBytes"] = @(value->u.int64);
+                } else if (std::strcmp(key, "total-bytes") == 0) {
+                    stats[@"cacheTotalBytes"] = @(value->u.int64);
+                } else if (std::strcmp(key, "raw-input-rate") == 0) {
+                    stats[@"inputRate"] = @(value->u.int64);
+                }
+            }
+        }
+        mpv_free_node_contents(&cache);
+    }
+
+    mach_task_basic_info_data_t taskInfo;
+    mach_msg_type_number_t taskInfoCount = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&taskInfo, &taskInfoCount) == KERN_SUCCESS) {
+        stats[@"memoryBytes"] = @(taskInfo.resident_size);
+    }
+
+    if (![NSJSONSerialization isValidJSONObject:stats]) {
+        return nil;
+    }
+    NSData *data = [NSJSONSerialization dataWithJSONObject:stats options:0 error:nil];
+    return data ? [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] : nil;
+}
 
 - (void)configureHdrForCurrentScreenIfNeeded {
     [self configureHdrForCurrentScreenWithReason:@"legacy" force:NO];
@@ -4009,6 +4095,7 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
     NSNumber *value = [rawValue isKindOfClass:[NSNumber class]] ? rawValue : nil;
     if ([type isEqualToString:@"controlsReady"]) {
         _controlsWebReady = YES;
+        _statsHudVisible.store(false);
 #if defined(__aarch64__)
         [_webView evaluateJavaScript:@"window.enablePlayerSeekPreview()" completionHandler:nil];
         if (_previewIndexScript) {
@@ -4057,6 +4144,14 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
     }
     if ([type isEqualToString:@"toggleFullscreen"]) {
         [self beginFullscreenTransitionWithReason:@"control-toggle"];
+    }
+    if ([type isEqualToString:@"statsHud"]) {
+        BOOL visible = value && value.doubleValue >= 0.5;
+        _statsHudVisible.store(visible);
+        if (visible) {
+            [self syncControls];
+        }
+        return;
     }
     if ([type isEqualToString:@"dragWindow"]) {
         [self beginWindowTrackingWithEdge:0];
