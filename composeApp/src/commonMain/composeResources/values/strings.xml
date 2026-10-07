@@ -349,6 +349,7 @@
     <string name="player_seek_position">Playback position</string>
     <string name="player_recovery_retrying">Connection lost. Retrying (%1$d/%2$d)…</string>
     <string name="player_recovery_switching_source">Source failed. Trying another source (%1$d/%2$d)…</string>
+    <string name="player_recovery_placeholder_rejected">This source is only a short clip, not the full video.</string>
     <string name="compose_action_reload">Reload</string>
     <string name="compose_player_picture_in_picture">Picture in picture</string>
     <string name="compose_player_pip_placeholder_title">Video playing in Picture-in-Picture</string>
