@@ -145,7 +145,7 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
     }
 }
 
-private fun PlayerScreenRuntime.resetTrackSelectionState() {
+internal fun PlayerScreenRuntime.resetTrackSelectionState() {
     trackPreferenceRestoreApplied = false
     preferredAudioSelectionApplied = false
     appliedAudioPreferences = null
