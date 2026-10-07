@@ -1456,6 +1456,7 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
 @end
 
 @implementation SeekPreviewWorker {
+    SeekPreviewStore *_store;
     NSString *_source;
     NSString *_host;
     NSArray<NSString *> *_headerLines;
@@ -1502,6 +1503,12 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
     _requestSerial.store(0);
     _latestPositionMs.store(0);
     return self;
+}
+
+- (SeekPreviewStore *)store {
+    @synchronized (self) {
+        return _store;
+    }
 }
 
 - (void)setStore:(SeekPreviewStore *)store {
