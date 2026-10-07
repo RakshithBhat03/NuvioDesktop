@@ -1,6 +1,8 @@
 package com.nuvio.app.features.player
 
 import androidx.compose.ui.Modifier
+import com.nuvio.app.features.details.MetaDetails
+import com.nuvio.app.features.details.MetaDetailsUiState
 import kotlinx.coroutines.test.runTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -14,6 +16,7 @@ class PlayerScreenRuntimeFailureRecoveryTest {
         var failure: PlayerPlaybackFailure? = null,
     ) : PlayerEngineController {
         val retries = mutableListOf<Pair<Long, Boolean>>()
+        var paused = false
 
         override fun takePlaybackFailure(): PlayerPlaybackFailure? = failure.also { failure = null }
         override fun retryAt(positionMs: Long, playWhenReady: Boolean): Boolean {
@@ -22,7 +25,9 @@ class PlayerScreenRuntimeFailureRecoveryTest {
         }
 
         override fun play() = Unit
-        override fun pause() = Unit
+        override fun pause() {
+            paused = true
+        }
         override fun seekTo(positionMs: Long) = Unit
         override fun seekBy(offsetMs: Long) = Unit
         override fun retry() = Unit
@@ -104,6 +109,56 @@ class PlayerScreenRuntimeFailureRecoveryTest {
             PlayerPlaybackSnapshot(isLoading = false, isPlaying = true, positionMs = 66_000L),
         )
         assertEquals(0, runtime.failureRecovery.retryCount)
+    }
+
+    private fun runtimeWithTitleRuntime(runtime: String?, scope: kotlinx.coroutines.CoroutineScope) =
+        PlayerScreenRuntime(testPlayerScreenArgs()).apply {
+            this.scope = scope
+            metaUiState = MetaDetailsUiState(
+                meta = MetaDetails(id = "tt1234567", type = "movie", name = "Title", runtime = runtime),
+            )
+        }
+
+    private fun loadedSnapshot(durationMs: Long) =
+        PlayerPlaybackSnapshot(isLoading = false, isPlaying = true, positionMs = 1_000L, durationMs = durationMs)
+
+    @Test
+    fun `a short clip for a feature length title is paused and reported once failovers run out`() = runTest {
+        val runtime = runtimeWithTitleRuntime("120 min", backgroundScope)
+        val controller = FailingController()
+        runtime.playerController = controller
+        runtime.failureRecovery.scopeTo("tt1234567|tt1234567|null|null", runtime.activePlaybackIdentity)
+        runtime.failureRecovery.failoverCount = MaxSourceFailovers
+
+        assertTrue(runtime.rejectPlaceholderSourceIfNeeded(loadedSnapshot(durationMs = 30_000L)))
+        assertTrue(controller.paused)
+        // The check does not run again for the same source.
+        assertFalse(runtime.rejectPlaceholderSourceIfNeeded(loadedSnapshot(durationMs = 30_000L)))
+    }
+
+    @Test
+    fun `full length files and unknown runtimes are not rejected`() = runTest {
+        val known = runtimeWithTitleRuntime("120 min", backgroundScope)
+        known.playerController = FailingController()
+        assertFalse(known.rejectPlaceholderSourceIfNeeded(loadedSnapshot(durationMs = 7_000_000L)))
+
+        val unknown = runtimeWithTitleRuntime(null, backgroundScope)
+        val controller = FailingController()
+        unknown.playerController = controller
+        assertFalse(unknown.rejectPlaceholderSourceIfNeeded(loadedSnapshot(durationMs = 30_000L)))
+        assertFalse(controller.paused)
+    }
+
+    @Test
+    fun `loading snapshots and engines without failure reporting are ignored`() = runTest {
+        val runtime = runtimeWithTitleRuntime("120 min", backgroundScope)
+        runtime.playerController = FailingController()
+        assertFalse(
+            runtime.rejectPlaceholderSourceIfNeeded(PlayerPlaybackSnapshot(isLoading = true, durationMs = 30_000L)),
+        )
+
+        runtime.playerController = FailingController(reportsPlaybackFailures = false)
+        assertFalse(runtime.rejectPlaceholderSourceIfNeeded(loadedSnapshot(durationMs = 30_000L)))
     }
 
     @Test
