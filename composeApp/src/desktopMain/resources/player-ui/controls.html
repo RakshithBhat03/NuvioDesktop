@@ -213,7 +213,9 @@
         </section>
         <div class="seek-wrap">
           <div id="seekPreview" class="seek-preview" hidden aria-hidden="true">
-            <img id="seekPreviewImage" alt="" decoding="async" hidden>
+            <div id="seekPreviewFrame" class="seek-preview-frame" hidden>
+              <img id="seekPreviewImage" alt="" decoding="async">
+            </div>
             <span id="seekPreviewTime"></span>
           </div>
           <input id="seek" class="scrub" type="range" min="0" max="10000" value="0" aria-label="Seek">
