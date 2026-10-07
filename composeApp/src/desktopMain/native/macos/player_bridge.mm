@@ -54,6 +54,20 @@ static constexpr long long kMediaKeySeekStepMs = 5 * 1000;
 // by the tail of a GOP, and only the spans can be seeked without a source read.
 static constexpr double kCachedRangeEpsilon = 0.05;
 
+// "playbackFailure" event payload is kind * 1000 + HTTP status (0 when unknown).
+// The numbering is mirrored by PlayerPlaybackFailureKind in common Kotlin.
+static constexpr int kPlaybackFailureLoading = 1;
+static constexpr int kPlaybackFailureUnknownFormat = 2;
+static constexpr int kPlaybackFailureNothingToPlay = 3;
+static constexpr int kPlaybackFailurePrematureEof = 4;
+static constexpr int kPlaybackFailureOther = 5;
+// An HTTP error older than this is not attributed to a later end-of-file error.
+static constexpr double kHttpStatusAttributionSeconds = 10.0;
+// A network stream that stops this far (and this fraction) short of its declared
+// duration was cut off rather than finished; smaller gaps are container slop.
+static constexpr double kPrematureEofMinGapSeconds = 30.0;
+static constexpr double kPrematureEofMinGapFraction = 0.02;
+
 // True when the supplied cached time ranges form one continuous span, so the
 // beginning/end cached flags cannot hide a hole in the middle.
 static bool nuvioCachedRangesCoverContinuously(
@@ -1451,6 +1465,11 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     std::atomic_bool _cachedPaused;
     std::atomic_bool _cachedLoading;
     std::atomic_bool _cachedEnded;
+    // Last "HTTP error NNN" mpv logged and when, to label a later load failure.
+    std::atomic<int> _lastHttpStatus;
+    std::atomic<double> _lastHttpStatusAt;
+    // Edge-trigger for the premature-EOF failure so each cut-off is reported once.
+    std::atomic_bool _prematureEofReported;
     BOOL _hasAppliedSubtitleStyle;
     BOOL _appliedSubtitleUseLibass;
     NSString *_appliedSubtitleTextColor;
@@ -1485,6 +1504,9 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     _cachedPaused.store(!playWhenReady);
     _cachedLoading.store(true);
     _cachedEnded.store(false);
+    _lastHttpStatus.store(0);
+    _lastHttpStatusAt.store(0.0);
+    _prematureEofReported.store(false);
     _mpvEventQueue = dispatch_queue_create("com.nuvio.desktop.mpv-events", DISPATCH_QUEUE_SERIAL);
     _mpvDrainQueue = dispatch_queue_create("com.nuvio.desktop.mpv-drain", DISPATCH_QUEUE_SERIAL);
     _mpvDrainStopped.store(false);
@@ -2068,6 +2090,13 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     setMpvOptionString(_mpv, "demuxer-subtitle-cache-bytes", "32MiB");
     setMpvOptionString(_mpv, "demuxer-audio-cache-bytes", "64MiB");
     setMpvOptionString(_mpv, "hr-seek", "no");
+    // mpv's 60s default leaves a dead connection looking like a hang; 20s lets
+    // the app recover while still tolerating a slow debrid first byte.
+    setMpvOptionString(_mpv, "network-timeout", "20");
+    // Re-open a dropped HTTP connection at the current byte offset inside
+    // libavformat, so brief outages never surface as playback failures.
+    setMpvOptionString(_mpv, "stream-lavf-o",
+        "reconnect=1,reconnect_streamed=1,reconnect_on_network_error=1,reconnect_delay_max=5");
 
     if (headerLines.count > 0) {
         NSMutableArray *escaped = [NSMutableArray arrayWithCapacity:headerLines.count];
@@ -2148,8 +2177,21 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                                    fullyCached:&fullyCached
                                  networkStream:&networkStream];
             BOOL paused = [self rawIsPaused];
-            BOOL ended = [self rawIsEnded];
-            BOOL loading = [self rawLoadingWithPaused:paused ended:ended duration:duration];
+            BOOL eofReached = [self rawIsEnded];
+            // keep-open turns a dropped connection into a plain EOF; report that
+            // as a failure instead of letting the app treat the title as finished.
+            BOOL prematureEof = eofReached && [self isPrematureNetworkEofWithDuration:duration
+                                                                             position:position
+                                                                        networkStream:networkStream];
+            BOOL ended = eofReached && !prematureEof;
+            if (prematureEof) {
+                if (!_prematureEofReported.exchange(true)) {
+                    [self reportPlaybackFailureKind:kPlaybackFailurePrematureEof];
+                }
+            } else if (!eofReached) {
+                _prematureEofReported.store(false);
+            }
+            BOOL loading = [self rawLoadingWithPaused:paused ended:eofReached duration:duration];
             double speed = [self rawSpeed];
             NSString *audioTracks = [self audioTracksJson] ?: @"[]";
             NSString *subtitleTracks = [self subtitleTracksJson] ?: @"[]";
@@ -2504,7 +2546,52 @@ static void nuvioMpvWakeup(void *ctx) {
     if (!mpv) return;
     _mpvDrainStopped.store(false);
     mpv_observe_property(mpv, 2, "current-ao", MPV_FORMAT_STRING);
+    // libavformat's HTTP status only reaches us through the log; mpv's own
+    // end-file error is just "loading failed" for 404, 410, 429 and 5xx alike.
+    mpv_request_log_messages(mpv, "warn");
     mpv_set_wakeup_callback(mpv, nuvioMpvWakeup, (__bridge void *)self);
+}
+
+- (void)noteHttpStatusFromLogText:(const char *)text {
+    if (!text) return;
+    static const char kMarker[] = "HTTP error ";
+    const char *found = strstr(text, kMarker);
+    if (!found) return;
+    int status = atoi(found + sizeof(kMarker) - 1);
+    if (status < 400 || status > 599) return;
+    _lastHttpStatus.store(status);
+    _lastHttpStatusAt.store([NSDate timeIntervalSinceReferenceDate]);
+}
+
+- (int)takeRecentHttpStatus {
+    int status = _lastHttpStatus.exchange(0);
+    double at = _lastHttpStatusAt.load();
+    if (status == 0 || [NSDate timeIntervalSinceReferenceDate] - at > kHttpStatusAttributionSeconds) {
+        return 0;
+    }
+    return status;
+}
+
+// Safe from any thread: sendPlayerEvent attaches the calling thread to the JVM
+// itself, and the drain and sync queues are both flushed before the sink is freed.
+- (void)reportPlaybackFailureKind:(int)kind {
+    int status = kind == kPlaybackFailureLoading || kind == kPlaybackFailureOther
+        ? [self takeRecentHttpStatus]
+        : 0;
+    [self sendPlayerEvent:@"playbackFailure" value:(double)(kind * 1000 + status)];
+}
+
+static int nuvioPlaybackFailureKindForMpvError(int error) {
+    switch (error) {
+        case MPV_ERROR_UNKNOWN_FORMAT:
+            return kPlaybackFailureUnknownFormat;
+        case MPV_ERROR_NOTHING_TO_PLAY:
+            return kPlaybackFailureNothingToPlay;
+        case MPV_ERROR_LOADING_FAILED:
+            return kPlaybackFailureLoading;
+        default:
+            return kPlaybackFailureOther;
+    }
 }
 
 - (void)scheduleMpvEventDrain {
@@ -2537,6 +2624,24 @@ static void nuvioMpvWakeup(void *ctx) {
                         // old softvol drained out of the renderer's queue).
                         [self applyVolumeSplit:_requestedVolumePercent.load()];
                     }
+                }
+                break;
+            }
+            case MPV_EVENT_START_FILE:
+                _lastHttpStatus.store(0);
+                break;
+            case MPV_EVENT_LOG_MESSAGE: {
+                mpv_event_log_message *message = (mpv_event_log_message *)event->data;
+                if (message) {
+                    [self noteHttpStatusFromLogText:message->text];
+                }
+                break;
+            }
+            case MPV_EVENT_END_FILE: {
+                // keep-open only holds a file that reached EOF; an error still ends it.
+                mpv_event_end_file *endFile = (mpv_event_end_file *)event->data;
+                if (endFile && endFile->reason == MPV_END_FILE_REASON_ERROR && !_mpvDrainStopped.load()) {
+                    [self reportPlaybackFailureKind:nuvioPlaybackFailureKindForMpvError(endFile->error)];
                 }
                 break;
             }
@@ -2844,6 +2949,26 @@ static void nuvioMpvWakeup(void *ctx) {
 
 - (BOOL)isEnded {
     return _cachedEnded.load();
+}
+
+- (BOOL)isPrematureNetworkEofWithDuration:(double)duration
+                                 position:(double)position
+                            networkStream:(BOOL)networkStream {
+    if (!networkStream || !std::isfinite(duration) || !std::isfinite(position) || duration <= 0.0) {
+        return NO;
+    }
+    double requiredGap = fmax(kPrematureEofMinGapSeconds, duration * kPrematureEofMinGapFraction);
+    if (duration - position <= requiredGap) {
+        return NO;
+    }
+    // A container can declare a longer duration than it holds. If the decoder has
+    // consumed (nearly) every byte of a sized stream, the file really ended.
+    long long streamEnd = [self int64Property:"stream-end" fallback:0];
+    long long streamPos = [self int64Property:"stream-pos" fallback:0];
+    if (streamEnd > 0 && streamPos > 0 && (double)streamPos >= (double)streamEnd * 0.98) {
+        return NO;
+    }
+    return YES;
 }
 
 - (BOOL)rawIsEnded {
