@@ -839,10 +839,6 @@ const setProgress = (positionMs, durationMs) => {
     }
   }
   renderCacheStatus();
-  if (statsHudVisible && update.stats && typeof update.stats === "object") {
-    lastPlayerStats = update.stats;
-    renderStatsHud();
-  }
 };
 
 const formatTransferSpeed = bytesPerSecond => {
@@ -3787,6 +3783,10 @@ window.playerUpdate = update => {
     audioTracks,
     subtitleTracks,
   };
+  if (statsHudVisible && update.stats && typeof update.stats === "object") {
+    lastPlayerStats = update.stats;
+    renderStatsHud();
+  }
   if (update.networkStream != null) seekPreviewSourceIsLocal = !update.networkStream;
   rememberSeekPreviewCachedSpans(state.cachedRanges, seekPreviewWholeFileReadable(), durationMs);
   warmSeekPreview();

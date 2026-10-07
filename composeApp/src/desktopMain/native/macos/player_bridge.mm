@@ -2921,8 +2921,8 @@ static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int heig
     addString(@"videoFormat", "video-format");
     addInt(@"width", "video-params/w");
     addInt(@"height", "video-params/h");
-    addInt(@"displayWidth", "width");
-    addInt(@"displayHeight", "height");
+    addInt(@"displayWidth", "dwidth");
+    addInt(@"displayHeight", "dheight");
     addDouble(@"containerFps", "container-fps");
     addDouble(@"estimatedFps", "estimated-vf-fps");
     addString(@"pixelFormat", "video-params/pixelformat");
