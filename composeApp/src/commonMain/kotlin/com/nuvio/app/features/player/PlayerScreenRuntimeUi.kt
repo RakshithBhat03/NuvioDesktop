@@ -654,6 +654,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                 onSnapshot = { snapshot ->
                     if (!updatePlaybackSnapshot(snapshot)) return@PlatformPlayerSurface
                     refreshAudioTracksIfChanged()
+                    noteRecoveryPlaybackProgress(snapshot)
                     if (!snapshot.isLoading) initialLoadCompleted = true
                     if (snapshot.isEnded) {
                         shouldPlay = false
@@ -667,12 +668,10 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                     if (message != null && !isDesktop && maybeFailoverPlaybackEngine(resolvedAutoEngine)) {
                         return@PlatformPlayerSurface
                     }
-                    errorMessage = message
-                    if (message != null) {
-                        scrubbingPositionMs = null
-                        controlsVisible = !playerControlsLocked
-                        removeFailedStreamFromCache()
+                    if (tryRecoverFromPlaybackError(message)) {
+                        return@PlatformPlayerSurface
                     }
+                    showPlaybackError(message)
                 },
             )
         }
