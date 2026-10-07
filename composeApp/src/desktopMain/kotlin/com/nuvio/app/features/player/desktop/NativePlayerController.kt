@@ -15,6 +15,7 @@ import com.nuvio.app.features.player.ParentalWarning
 import com.nuvio.app.features.player.PlayerControlsAction
 import com.nuvio.app.features.player.PlayerControlsState
 import com.nuvio.app.features.player.PlayerEngineController
+import com.nuvio.app.features.player.PlayerPlaybackFailure
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
 import com.nuvio.app.features.player.PlayerSeekStepMs
@@ -93,6 +94,13 @@ internal class NativePlayerController(
 
     @Volatile
     private var pendingSource: PendingSource? = null
+
+    /** Cause of the last failure handed to onError, read once by the recovery layer. */
+    @Volatile
+    private var lastPlaybackFailure: PlayerPlaybackFailure? = null
+
+    /** Native handle that already reported a failure; a player fails at most once. */
+    private var failureReportedForHandle: Long = 0L
     @Volatile
     private var releaseRequested: Boolean = false
     private val createsInFlight = mutableSetOf<Thread>()
@@ -547,6 +555,7 @@ internal class NativePlayerController(
             "dragWindow" -> NativePlayerBridge.beginWindowDrag(handle)
             "volumeChange" -> setFallbackVolume(value.toFloat())
             "volumeChangeTemporary" -> setTemporaryVolume(value.toFloat())
+            NativePlaybackFailureEvent -> handlePlaybackFailure(value)
             "setPlaybackSpeed" -> {
                 val speed = value.toFloat()
                 setPlaybackSpeed(speed)
@@ -566,6 +575,19 @@ internal class NativePlayerController(
                 }
             }
         }
+    }
+
+    private fun handlePlaybackFailure(value: Double) {
+        val failure = decodeNativePlaybackFailure(value) ?: return
+        val current = handle
+        val pending = pendingSource
+        if (current == 0L || pending == null || releaseRequested || failureReportedForHandle == current) return
+        failureReportedForHandle = current
+        log.w { "native playback failure handle=$current kind=${failure.kind} http=${failure.httpStatus}" }
+        lastPlaybackFailure = failure
+        pending.onError(failure.describe())
+        // Consumers that do not read the cause must not see it attached to a later, unrelated error.
+        lastPlaybackFailure = null
     }
 
     @Synchronized
@@ -963,6 +985,26 @@ internal class NativePlayerController(
             nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
             onError = pending.onError,
         )
+    }
+
+    override val reportsPlaybackFailures: Boolean
+        get() = DesktopHostOs.current == DesktopHostOs.MACOS
+
+    override fun takePlaybackFailure(): PlayerPlaybackFailure? =
+        lastPlaybackFailure.also { lastPlaybackFailure = null }
+
+    override fun retryAt(positionMs: Long, playWhenReady: Boolean): Boolean {
+        val pending = pendingSource ?: return false
+        attach(
+            sourceUrl = pending.sourceUrl,
+            sourceHeaders = pending.headerLines.toHeaderMap(),
+            playWhenReady = playWhenReady,
+            initialPositionMs = positionMs,
+            decoderPriority = pending.decoderPriority,
+            nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
+            onError = pending.onError,
+        )
+        return true
     }
 
     override fun setPlaybackSpeed(speed: Float) {

@@ -37,6 +37,18 @@ interface PlayerEngineController {
     fun updateNowPlayingMetadata(info: PlayerNowPlayingInfo) {}
     fun clearNowPlayingInfo() {}
 
+    /** True when this engine fills [takePlaybackFailure], so failure recovery may act on it. */
+    val reportsPlaybackFailures: Boolean get() = false
+
+    /** Returns and clears the cause behind the latest error the engine raised, if it knows it. */
+    fun takePlaybackFailure(): PlayerPlaybackFailure? = null
+
+    /**
+     * Re-opens the current source at [positionMs] instead of the position it was first attached
+     * with. Returns false when the engine cannot, so callers fall back to the error path.
+     */
+    fun retryAt(positionMs: Long, playWhenReady: Boolean): Boolean = false
+
     /** Optional barrier for platforms that must release native resources before their route is removed. */
     fun releaseBeforeNavigation(
         onReleased: () -> Unit,
