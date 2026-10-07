@@ -222,7 +222,10 @@ static bool nuvioCachedRangesCoverContinuously(
                                 stripSdh:(BOOL)stripSdh;
 - (void)handleScriptMessage:(NSDictionary *)message;
 #if defined(__aarch64__)
-- (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs imageUrl:(NSString *)imageUrl;
+- (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs
+                                   imageUrl:(NSString *)imageUrl
+                                    retryMs:(long long)retryMs;
+- (NSTimeInterval)previewPlaybackHoldRemaining;
 #endif
 - (void)startMpvEventDrain;
 - (void)applyVolumeSplit:(double)percent;
@@ -1139,24 +1142,68 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
 }
 
 #if defined(__aarch64__)
+// Hosts that answered a preview fetch with 429, process-wide so the next title
+// from the same host starts in backoff instead of rediscovering the limit.
+static const NSTimeInterval kSeekPreviewHostLimitTtl = 30.0 * 60.0;
+static const NSTimeInterval kSeekPreviewHostStartPause = 15.0;
+static const int kSeekPreviewMaxFailures = 5;
+
+static NSMutableDictionary<NSString *, NSNumber *> *seekPreviewRateLimitedHosts() {
+    static NSMutableDictionary<NSString *, NSNumber *> *hosts;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ hosts = [NSMutableDictionary dictionary]; });
+    return hosts;
+}
+
+static NSString *seekPreviewHostForSource(NSString *source) {
+    NSURL *url = [NSURL URLWithString:source];
+    return url.host.lowercaseString;
+}
+
+static void seekPreviewMarkHostRateLimited(NSString *host) {
+    if (host.length == 0) return;
+    NSMutableDictionary *hosts = seekPreviewRateLimitedHosts();
+    @synchronized (hosts) {
+        hosts[host] = @([NSDate timeIntervalSinceReferenceDate]);
+    }
+}
+
+static BOOL seekPreviewHostIsRateLimited(NSString *host) {
+    if (host.length == 0) return NO;
+    NSMutableDictionary *hosts = seekPreviewRateLimitedHosts();
+    @synchronized (hosts) {
+        NSNumber *hitAt = hosts[host];
+        if (!hitAt) return NO;
+        if ([NSDate timeIntervalSinceReferenceDate] - hitAt.doubleValue < kSeekPreviewHostLimitTtl) return YES;
+        [hosts removeObjectForKey:host];
+        return NO;
+    }
+}
+
 // A separate, muted libmpv handle keeps preview seeks away from the playing handle.
 // It is created only after a seek-bar hover and released after inactivity.
 @interface SeekPreviewWorker : NSObject
 - (instancetype)initWithSource:(NSString *)source
                    headerLines:(NSArray<NSString *> *)headerLines
                         player:(MpvWebPlayer *)player;
-- (void)requestPositionMs:(long long)positionMs;
+- (void)requestPositionMs:(long long)positionMs warm:(BOOL)warm;
 - (void)shutdown;
 @end
 
 @implementation SeekPreviewWorker {
     NSString *_source;
+    NSString *_host;
     NSArray<NSString *> *_headerLines;
     __weak MpvWebPlayer *_player;
     dispatch_queue_t _queue;
     mpv_handle *_mpv;
     BOOL _loaded;
-    NSTimeInterval _retryLoadAfter;
+    // Failure bookkeeping lives on _queue. Consecutive failures stretch the
+    // pause before the next network attempt; enough of them end previews for
+    // the session so a struggling server is never kept busy.
+    int _consecutiveFailures;
+    NSTimeInterval _backoffUntil;
+    int _lastHttpStatus;
     std::atomic_bool _stopped;
     std::atomic<uint64_t> _requestSerial;
     std::atomic<long long> _latestPositionMs;
@@ -1168,8 +1215,13 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     self = [super init];
     if (!self) return nil;
     _source = [source copy];
+    _host = seekPreviewHostForSource(_source);
     _headerLines = [headerLines copy];
     _player = player;
+    if (seekPreviewHostIsRateLimited(_host)) {
+        _consecutiveFailures = 1;
+        _backoffUntil = [NSDate timeIntervalSinceReferenceDate] + kSeekPreviewHostStartPause;
+    }
     _queue = dispatch_queue_create("com.nuvio.desktop.seek-preview", DISPATCH_QUEUE_SERIAL);
     _stopped.store(false);
     _requestSerial.store(0);
@@ -1185,18 +1237,54 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     _loaded = NO;
 }
 
+// The only cheap view of HTTP status codes is the demuxer's log; 429/503 are
+// the answers that mean "slow down" rather than "this source is broken".
+- (void)observeEvent:(mpv_event *)event {
+    if (event->event_id != MPV_EVENT_LOG_MESSAGE || !event->data) return;
+    const char *text = ((mpv_event_log_message *)event->data)->text;
+    if (!text) return;
+    BOOL httpLine = strcasestr(text, "http") || strcasestr(text, "server returned");
+    if (httpLine && strstr(text, "429")) _lastHttpStatus = 429;
+    else if (httpLine && strstr(text, "503")) _lastHttpStatus = 503;
+    else if (strcasestr(text, "too many requests")) _lastHttpStatus = 429;
+}
+
+- (void)drainPendingEvents {
+    while (_mpv) {
+        mpv_event *event = mpv_wait_event(_mpv, 0);
+        if (event->event_id == MPV_EVENT_NONE) break;
+        [self observeEvent:event];
+    }
+}
+
 - (BOOL)failLoad {
     [self destroyMpv];
-    // A short cooldown avoids hammering a failing source without leaving
-    // previews dead for the rest of the hover.
-    _retryLoadAfter = [NSDate timeIntervalSinceReferenceDate] + 3.0;
+    // Shutdown aborts in-flight waits; that is not the source's fault.
+    if (_stopped.load()) return NO;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    _consecutiveFailures++;
+    // 2 s doubling to 30 s; an explicit 429/503 waits at least 10 s.
+    double wait = fmin(30.0, 2.0 * pow(2.0, MIN(_consecutiveFailures - 1, 4)));
+    if (_lastHttpStatus != 0) wait = fmax(wait, 10.0);
+    if (_lastHttpStatus == 429) seekPreviewMarkHostRateLimited(_host);
+    _lastHttpStatus = 0;
+    _backoffUntil = now + wait;
     return NO;
+}
+
+// Zero when a network attempt may start, -1 once previews are given up for
+// this session, otherwise the milliseconds left in the backoff.
+- (long long)backoffRemainingMs {
+    if (_consecutiveFailures >= kSeekPreviewMaxFailures) return -1;
+    double remaining = _backoffUntil - [NSDate timeIntervalSinceReferenceDate];
+    return remaining > 0.0 ? (long long)ceil(remaining * 1000.0) : 0;
 }
 
 - (BOOL)waitForEvent:(mpv_event_id)target timeout:(double)timeout {
     NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + timeout;
     while (!_stopped.load() && [NSDate timeIntervalSinceReferenceDate] < deadline) {
         mpv_event *event = mpv_wait_event(_mpv, 0.1);
+        [self observeEvent:event];
         if (event->event_id == target) return YES;
         if (event->event_id == MPV_EVENT_END_FILE || event->event_id == MPV_EVENT_SHUTDOWN) return NO;
     }
@@ -1209,6 +1297,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     BOOL frameReady = NO;
     while (!_stopped.load() && [NSDate timeIntervalSinceReferenceDate] < deadline) {
         mpv_event *event = mpv_wait_event(_mpv, 0.1);
+        [self observeEvent:event];
         if (event->event_id == MPV_EVENT_FILE_LOADED) fileLoaded = YES;
         if (event->event_id == MPV_EVENT_PLAYBACK_RESTART) frameReady = YES;
         if (fileLoaded && frameReady) return YES;
@@ -1219,10 +1308,11 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
 
 - (BOOL)loadAtPositionMs:(long long)positionMs {
     if (_loaded) return YES;
-    if ([NSDate timeIntervalSinceReferenceDate] < _retryLoadAfter) return NO;
+    if ([self backoffRemainingMs] != 0) return NO;
     if (_mpv) [self destroyMpv];
     _mpv = mpv_create();
     if (!_mpv) return [self failLoad];
+    mpv_request_log_messages(_mpv, "warn");
     setMpvOptionString(_mpv, "config", "no");
     setMpvOptionString(_mpv, "osc", "no");
     setMpvOptionString(_mpv, "vo", "null");
@@ -1298,6 +1388,7 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
 - (NSString *)captureAtPositionMs:(long long *)positionMs serial:(uint64_t)serial {
     BOOL wasLoaded = _loaded;
     long long loadPositionMs = *positionMs;
+    [self drainPendingEvents];
     if (![self loadAtPositionMs:*positionMs]) return nil;
     if (_stopped.load()) return nil;
     if (serial != 0) *positionMs = _latestPositionMs.load();
@@ -1364,25 +1455,57 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
         }
     }
     mpv_free_node_contents(&result);
+    if (imageUrl) {
+        _consecutiveFailures = 0;
+        _lastHttpStatus = 0;
+    }
     return imageUrl;
 }
 
-- (void)requestPositionMs:(long long)positionMs {
+- (void)requestPositionMs:(long long)positionMs warm:(BOOL)warm {
     if (_stopped.load()) return;
     _latestPositionMs.store(positionMs);
     uint64_t serial = _requestSerial.fetch_add(1) + 1;
     dispatch_async(_queue, ^{
         @autoreleasepool {
             if (self->_stopped.load() || self->_requestSerial.load() != serial) return;
-            long long capturedPositionMs = positionMs;
-            NSString *imageUrl = [self captureAtPositionMs:&capturedPositionMs serial:serial];
-            if (self->_stopped.load()) return;
-            dispatch_async(dispatch_get_main_queue(), ^{
-                MpvWebPlayer *player = self->_player;
-                if (player && !self->_stopped.load()) {
-                    [player handleSeekPreviewResultAtPositionMs:capturedPositionMs imageUrl:imageUrl];
+            // Previews yield to playback and to a server that pushed back.
+            // Neither counts as a failure; the controls are told when to ask again.
+            MpvWebPlayer *gatePlayer = self->_player;
+            NSTimeInterval playbackHold = gatePlayer ? [gatePlayer previewPlaybackHoldRemaining] : 0.0;
+            long long backoffMs = [self backoffRemainingMs];
+            if (playbackHold > 0.0 || backoffMs != 0) {
+                // The idle handle holds a connection open; release it so it
+                // cannot compete with the playing stream.
+                if (playbackHold > 0.0) [self destroyMpv];
+                if (!warm) {
+                    long long retryMs = backoffMs < 0
+                        ? -1
+                        : MAX(backoffMs, (long long)ceil(playbackHold * 1000.0));
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        MpvWebPlayer *player = self->_player;
+                        if (player && !self->_stopped.load()) {
+                            [player handleSeekPreviewResultAtPositionMs:positionMs imageUrl:nil retryMs:retryMs];
+                        }
+                    });
                 }
-            });
+                return;
+            }
+            // A warm-up only needs the stream open; an open handle has nothing to do.
+            if (!(warm && self->_loaded)) {
+                long long capturedPositionMs = positionMs;
+                NSString *imageUrl = [self captureAtPositionMs:&capturedPositionMs serial:serial];
+                if (self->_stopped.load()) return;
+                long long remainingMs = imageUrl ? 0 : [self backoffRemainingMs];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    MpvWebPlayer *player = self->_player;
+                    if (player && !self->_stopped.load()) {
+                        [player handleSeekPreviewResultAtPositionMs:capturedPositionMs
+                                                           imageUrl:imageUrl
+                                                            retryMs:remainingMs];
+                    }
+                });
+            }
             // Keep the opened stream around between hovers so returning to the
             // seek bar does not pay for a fresh network open and probe.
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 45 * NSEC_PER_SEC), self->_queue, ^{
@@ -1451,6 +1574,12 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
 #if defined(__aarch64__)
     NSArray<NSString *> *_previewHeaderLines;
     SeekPreviewWorker *_previewWorker;
+    // Network previews wait until this time (reference-date seconds) so they
+    // never compete with a stream that is buffering or dropping frames.
+    std::atomic<double> _previewHoldUntil;
+    // Touched only on _mpvEventQueue, where syncControls samples the counters.
+    std::vector<std::pair<NSTimeInterval, int64_t>> _previewDropEvents;
+    int64_t _previewLastDropTotal;
 #endif
     BOOL _controlsSyncInFlight;
     NSRect _lastAppliedNativeLayoutBounds;
@@ -1507,6 +1636,10 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
     _lastHttpStatus.store(0);
     _lastHttpStatusAt.store(0.0);
     _prematureEofReported.store(false);
+#if defined(__aarch64__)
+    _previewHoldUntil.store(0.0);
+    _previewLastDropTotal = -1;
+#endif
     _mpvEventQueue = dispatch_queue_create("com.nuvio.desktop.mpv-events", DISPATCH_QUEUE_SERIAL);
     _mpvDrainQueue = dispatch_queue_create("com.nuvio.desktop.mpv-drain", DISPATCH_QUEUE_SERIAL);
     _mpvDrainStopped.store(false);
@@ -2205,6 +2338,16 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
                                  loading:loading
                                    ended:ended
                                    speed:speed];
+#if defined(__aarch64__)
+            [self updatePreviewPlaybackHoldPaused:paused
+                                          loading:loading
+                                            ended:ended
+                                       cacheAhead:cacheAhead
+                                         duration:duration
+                                         position:position
+                                      fullyCached:fullyCached
+                                    networkStream:networkStream];
+#endif
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 self->_controlsSyncInFlight = NO;
@@ -2240,6 +2383,63 @@ static void setMpvOptionString(mpv_handle *mpv, const char *name, const char *va
         }
     });
 }
+
+#if defined(__aarch64__)
+// Previews that read from the network wait while playback is struggling:
+// buffering, a thin read-ahead, or a burst of dropped frames. Local and fully
+// cached sources never hold; nothing they do competes with playback's network.
+- (void)updatePreviewPlaybackHoldPaused:(BOOL)paused
+                                loading:(BOOL)loading
+                                  ended:(BOOL)ended
+                             cacheAhead:(double)cacheAhead
+                               duration:(double)duration
+                               position:(double)position
+                            fullyCached:(BOOL)fullyCached
+                          networkStream:(BOOL)networkStream {
+    if (!networkStream || fullyCached) {
+        _previewHoldUntil.store(0.0);
+        return;
+    }
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    double holdUntil = _previewHoldUntil.load();
+    // Hold a few seconds past recovery so preview traffic does not resume the
+    // instant the stream is healthy again.
+    if (loading || [self flagProperty:"paused-for-cache" fallback:NO]) {
+        holdUntil = fmax(holdUntil, now + 5.0);
+    } else if (!ended && cacheAhead < 10.0 && duration - position > 10.0) {
+        holdUntil = fmax(holdUntil, now + 5.0);
+    }
+    int64_t drops = [self int64Property:"frame-drop-count" fallback:0]
+        + [self int64Property:"decoder-frame-drop-count" fallback:0];
+    if (_previewLastDropTotal < 0 || drops < _previewLastDropTotal) {
+        _previewLastDropTotal = drops;
+    } else if (drops > _previewLastDropTotal) {
+        // Drops while paused or buffering are not preview traffic's doing.
+        if (!paused && !loading) {
+            _previewDropEvents.emplace_back(now, drops - _previewLastDropTotal);
+        }
+        _previewLastDropTotal = drops;
+    }
+    int64_t recentDrops = 0;
+    for (auto it = _previewDropEvents.begin(); it != _previewDropEvents.end();) {
+        if (now - it->first > 20.0) {
+            it = _previewDropEvents.erase(it);
+        } else {
+            recentDrops += it->second;
+            ++it;
+        }
+    }
+    if (recentDrops >= 3) {
+        holdUntil = fmax(holdUntil, now + 30.0);
+        _previewDropEvents.clear();
+    }
+    _previewHoldUntil.store(holdUntil);
+}
+
+- (NSTimeInterval)previewPlaybackHoldRemaining {
+    return fmax(_previewHoldUntil.load() - [NSDate timeIntervalSinceReferenceDate], 0.0);
+}
+#endif
 
 - (void)configureHdrForCurrentScreenIfNeeded {
     [self configureHdrForCurrentScreenWithReason:@"legacy" force:NO];
@@ -3366,7 +3566,8 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
         return;
     }
 #if defined(__aarch64__)
-    if ([type isEqualToString:@"seekPreview"] && value && _sourceUrl.length > 0 && _webView) {
+    BOOL previewWarm = [type isEqualToString:@"seekPreviewWarm"];
+    if (([type isEqualToString:@"seekPreview"] || previewWarm) && value && _sourceUrl.length > 0 && _webView) {
         long long positionMs = llround(value.doubleValue);
         long long durationMs = [self durationMs];
         if (durationMs > 0 && positionMs >= 0 && positionMs <= durationMs) {
@@ -3375,10 +3576,10 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
                                                                headerLines:_previewHeaderLines
                                                                     player:self];
             }
-            [_previewWorker requestPositionMs:positionMs];
-        } else {
+            [_previewWorker requestPositionMs:positionMs warm:previewWarm];
+        } else if (!previewWarm) {
             // Answer explicitly so the controls can retry instead of waiting.
-            [self handleSeekPreviewResultAtPositionMs:positionMs imageUrl:nil];
+            [self handleSeekPreviewResultAtPositionMs:positionMs imageUrl:nil retryMs:0];
         }
         return;
     }
@@ -3433,13 +3634,17 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
 }
 
 #if defined(__aarch64__)
-- (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs imageUrl:(NSString *)imageUrl {
+- (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs
+                                   imageUrl:(NSString *)imageUrl
+                                    retryMs:(long long)retryMs {
     if (!_webView || !_controlsWebReady) return;
     NSString *encodedImage = imageUrl
         ? [NSString stringWithFormat:@"\"%@\"", imageUrl]
         : @"null";
+    // retryMs: wait before asking again; negative ends previews for the session.
     NSString *script = [NSString stringWithFormat:
-        @"window.playerSeekPreview({positionMs:%lld,imageUrl:%@})", positionMs, encodedImage];
+        @"window.playerSeekPreview({positionMs:%lld,imageUrl:%@,retryMs:%lld})",
+        positionMs, encodedImage, retryMs];
     [_webView evaluateJavaScript:script completionHandler:nil];
 }
 #endif

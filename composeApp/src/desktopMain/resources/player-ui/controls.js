@@ -3207,6 +3207,9 @@ const seekPreviewFailureRetryMs = 3000;
 const seekThumbWidth = 10;
 const scrubChangeIntervalMs = 200;
 let seekPreviewEnabled = false;
+// Set when native gives up on previews for this session (repeated failures or
+// a rate-limited source); nothing more is requested from the stream then.
+let seekPreviewGivenUp = false;
 // Every span (ms) the player has reported as cached this session. Previews
 // are generated only inside these spans and stay available after the
 // playback cache evicts them.
@@ -3309,6 +3312,7 @@ const positionSeekPreview = (rectWidth, x) => {
 const requestSeekPreview = () => {
   seekPreviewTimer = 0;
   const bucketMs = seekPreviewBucketMs;
+  if (seekPreviewGivenUp) return;
   if (seekPreview.hidden || bucketMs === null || seekPreviewCache.has(bucketMs)) return;
   const elapsedMs = performance.now() - seekPreviewLastRequestAt;
   const delay = Math.max(
@@ -3335,12 +3339,13 @@ const requestSeekPreview = () => {
 const seekPreviewWarmIntervalMs = 30000;
 let seekPreviewWarmedAt = -Infinity;
 const warmSeekPreview = () => {
-  if (!seekPreviewEnabled || !seekPreview.hidden || !state.controlsVisible || !(state.durationMs > 0)) return;
+  if (!seekPreviewEnabled || seekPreviewGivenUp || !seekPreview.hidden || !state.controlsVisible || !(state.durationMs > 0)) return;
   if (performance.now() - seekPreviewWarmedAt < seekPreviewWarmIntervalMs) return;
   const bucketMs = seekPreviewBucketFor(Math.max(0, Number(state.positionMs) || 0));
   if (bucketMs === null) return;
   seekPreviewWarmedAt = performance.now();
-  send("seekPreview", bucketMs);
+  // Warm-ups are dropped silently by native while previews are paused.
+  send("seekPreviewWarm", bucketMs);
 };
 
 const scheduleSeekPreview = () => {
@@ -3351,14 +3356,18 @@ const scheduleSeekPreview = () => {
 // The macOS arm64 bridge enables previews after the controls page is ready.
 window.enablePlayerSeekPreview = () => {
   seekPreviewEnabled = true;
+  seekPreviewGivenUp = false;
   seekPreviewCache.clear();
   seekPreviewRetryAfter.clear();
   seekPreviewCachedSpans = [];
   rememberSeekPreviewCachedSpans(state.cachedRanges, seekPreviewWholeFileReadable(), Number(state.durationMs) || 0);
 };
 
-window.playerSeekPreview = ({ positionMs, imageUrl }) => {
+// retryMs is native's pacing answer when it could not produce a frame: how
+// long playback or a backoff asks us to wait, or negative to stop for good.
+window.playerSeekPreview = ({ positionMs, imageUrl, retryMs }) => {
   if (!seekPreviewEnabled || !Number.isFinite(positionMs)) return;
+  if (retryMs < 0) seekPreviewGivenUp = true;
   if (imageUrl) {
     seekPreviewRetryAfter.delete(positionMs);
     seekPreviewCache.delete(positionMs);
@@ -3367,7 +3376,10 @@ window.playerSeekPreview = ({ positionMs, imageUrl }) => {
       seekPreviewCache.delete(seekPreviewCache.keys().next().value);
     }
   } else if (!seekPreviewCache.has(positionMs)) {
-    seekPreviewRetryAfter.set(positionMs, Date.now() + seekPreviewFailureRetryMs);
+    seekPreviewRetryAfter.set(
+      positionMs,
+      Date.now() + Math.max(seekPreviewFailureRetryMs, Number(retryMs) || 0),
+    );
     if (seekPreviewRetryAfter.size > seekPreviewCacheLimit) {
       seekPreviewRetryAfter.delete(seekPreviewRetryAfter.keys().next().value);
     }
