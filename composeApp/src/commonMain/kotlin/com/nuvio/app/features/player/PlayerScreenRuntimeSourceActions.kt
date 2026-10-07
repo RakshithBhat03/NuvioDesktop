@@ -272,19 +272,24 @@ internal fun PlayerScreenRuntime.switchToP2pEpisodeStream(
     applyEpisodeStreamMetadata(stream, episode, resume)
 }
 
+/**
+ * @param resumePositionMs where the new source starts; defaults to the current playback position.
+ *   Failure recovery passes its own because a source that never started has no position to carry.
+ */
 internal fun PlayerScreenRuntime.switchToSource(
     stream: StreamItem,
+    resumePositionMs: Long? = null,
     saveForReuse: Boolean = true,
 ) {
-    if (prepareServerForPlayer(stream) { switchToSource(it) }) return
+    if (prepareServerForPlayer(stream) { switchToSource(it, resumePositionMs) }) return
     // The resolved URL expires after a few hours, so it isn't kept for reuse.
-    if (resolveYouTubeForPlayer(stream) { switchToSource(it, saveForReuse = false) }) return
+    if (resolveYouTubeForPlayer(stream) { switchToSource(it, resumePositionMs, saveForReuse = false) }) return
     if (
         resolveDebridForPlayer(
             stream = stream,
             season = activeSeasonNumber,
             episode = activeEpisodeNumber,
-            onResolved = { switchToSource(it) },
+            onResolved = { switchToSource(it, resumePositionMs) },
             onStale = {
                 val vid = activeVideoId
                 if (vid != null) {
@@ -310,7 +315,7 @@ internal fun PlayerScreenRuntime.switchToSource(
         activeSourceIdentityKey = sourceIdentityKey ?: activeSourceIdentityKey
         return
     }
-    val currentPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
+    val currentPositionMs = resumePositionMs ?: playbackSnapshot.positionMs.coerceAtLeast(0L)
     flushWatchProgress()
     stopActiveP2pStream()
     val currentVideoId = activeVideoId
