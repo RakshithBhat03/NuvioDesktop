@@ -7,6 +7,7 @@
 #import <OpenGL/gl3.h>
 #import <QuartzCore/QuartzCore.h>
 #import <WebKit/WebKit.h>
+#import <CommonCrypto/CommonDigest.h>
 
 #include <jni.h>
 #include <mpv/client.h>
@@ -224,7 +225,8 @@ static bool nuvioCachedRangesCoverContinuously(
 #if defined(__aarch64__)
 - (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs
                                    imageUrl:(NSString *)imageUrl
-                                    retryMs:(long long)retryMs;
+                                    retryMs:(long long)retryMs
+                                   cropJson:(NSString *)cropJson;
 - (NSTimeInterval)previewPlaybackHoldRemaining;
 #endif
 - (void)startMpvEventDrain;
@@ -1180,12 +1182,275 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
     }
 }
 
+// Preview frames outlive the session so a title watched before shows its
+// timeline immediately. They live under the user's cache directory (the same
+// ~/Library/Caches/Nuvio the Kotlin side uses), never inside the app bundle.
+static const unsigned long long kSeekPreviewDiskBudgetBytes = 200ull * 1024ull * 1024ull;
+static const NSTimeInterval kSeekPreviewDiskMaxAge = 30.0 * 24.0 * 3600.0;
+// Reads refresh a file's mtime at most this often, so LRU order costs one
+// attribute write per file per day instead of one per hover.
+static const NSTimeInterval kSeekPreviewDiskTouchAfter = 24.0 * 3600.0;
+static const unsigned kSeekPreviewPruneEveryWrites = 64;
+static const NSUInteger kSeekPreviewIndexLimit = 4000;
+
+static NSURL *seekPreviewDiskRoot() {
+    NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (caches.length == 0) return nil;
+    return [[NSURL fileURLWithPath:caches isDirectory:YES]
+        URLByAppendingPathComponent:@"Nuvio/seek-previews" isDirectory:YES];
+}
+
+static NSString *seekPreviewDataUrl(NSData *jpeg) {
+    return [@"data:image/jpeg;base64," stringByAppendingString:[jpeg base64EncodedStringWithOptions:0]];
+}
+
+@interface SeekPreviewStore : NSObject
++ (NSString *)keyForSource:(NSString *)source
+                  fileSize:(long long)fileSize
+                durationMs:(long long)durationMs
+                     width:(long long)width
+                    height:(long long)height;
++ (void)pruneAsync;
+- (instancetype)initWithKey:(NSString *)key;
+- (NSArray<NSNumber *> *)cachedPositions;
+- (NSData *)frameAtPositionMs:(long long)positionMs;
+- (void)storeFrame:(NSData *)jpeg atPositionMs:(long long)positionMs;
+- (NSArray<NSNumber *> *)savedCrop;
+- (void)saveCrop:(NSArray<NSNumber *> *)crop;
+@end
+
+@implementation SeekPreviewStore {
+    NSURL *_directory;
+    std::atomic<unsigned> _writesSincePrune;
+    std::atomic_bool _directoryReady;
+}
+
+// A debrid URL carries per-link tokens and a rotating CDN host, so the URL is
+// no identity at all. The file name (last path component, query dropped),
+// the exact byte length, the duration and the video size are all properties
+// of the file itself and survive a re-resolved link; the host is left out for
+// the same reason. Without a byte length (chunked or HLS) there is no safe
+// identity, so nothing is persisted.
++ (NSString *)keyForSource:(NSString *)source
+                  fileSize:(long long)fileSize
+                durationMs:(long long)durationMs
+                     width:(long long)width
+                    height:(long long)height {
+    if (source.length == 0 || fileSize <= 0 || durationMs <= 0) return nil;
+    NSURL *url = [NSURL URLWithString:source];
+    NSString *scheme = url.scheme.lowercaseString;
+    BOOL remote = [scheme isEqualToString:@"http"] || [scheme isEqualToString:@"https"];
+    NSString *name = (remote ? url.path : source).lastPathComponent.lowercaseString;
+    if (name.length == 0 || [name isEqualToString:@"/"]) return nil;
+    NSString *identity = [NSString stringWithFormat:@"v1|%@|%lld|%lld|%lldx%lld",
+                          name, fileSize, durationMs, width, height];
+    const char *bytes = identity.UTF8String;
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes, (CC_LONG)strlen(bytes), digest);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:32];
+    for (int i = 0; i < 16; i++) [hex appendFormat:@"%02x", digest[i]];
+    return hex;
+}
+
+- (instancetype)initWithKey:(NSString *)key {
+    self = [super init];
+    NSURL *root = seekPreviewDiskRoot();
+    if (!self || !root || key.length == 0) return nil;
+    _directory = [root URLByAppendingPathComponent:key isDirectory:YES];
+    _writesSincePrune.store(0);
+    _directoryReady.store(false);
+    return self;
+}
+
+- (NSArray<NSNumber *> *)cachedPositions {
+    NSArray<NSURL *> *entries = [[NSFileManager defaultManager]
+        contentsOfDirectoryAtURL:_directory
+        includingPropertiesForKeys:@[NSURLContentModificationDateKey]
+        options:NSDirectoryEnumerationSkipsHiddenFiles error:nil];
+    NSMutableArray<NSNumber *> *positions = [NSMutableArray array];
+    NSDate *oldest = [NSDate dateWithTimeIntervalSinceNow:-kSeekPreviewDiskMaxAge];
+    for (NSURL *entry in entries) {
+        if (![entry.pathExtension isEqualToString:@"jpg"]) continue;
+        long long positionMs = entry.URLByDeletingPathExtension.lastPathComponent.longLongValue;
+        if (positionMs < 0 || positions.count >= kSeekPreviewIndexLimit) continue;
+        NSDate *modified = nil;
+        [entry getResourceValue:&modified forKey:NSURLContentModificationDateKey error:nil];
+        if (modified && [modified compare:oldest] == NSOrderedAscending) continue;
+        [positions addObject:@(positionMs)];
+    }
+    return positions;
+}
+
+- (NSURL *)frameUrlForPositionMs:(long long)positionMs {
+    return [_directory URLByAppendingPathComponent:[NSString stringWithFormat:@"%lld.jpg", positionMs]];
+}
+
+- (NSData *)frameAtPositionMs:(long long)positionMs {
+    NSURL *url = [self frameUrlForPositionMs:positionMs];
+    NSData *jpeg = [NSData dataWithContentsOfURL:url options:0 error:nil];
+    if (jpeg.length == 0) return nil;
+    NSDate *modified = nil;
+    [url getResourceValue:&modified forKey:NSURLContentModificationDateKey error:nil];
+    if (modified && -[modified timeIntervalSinceNow] > kSeekPreviewDiskTouchAfter) {
+        [[NSFileManager defaultManager] setAttributes:@{NSFileModificationDate: [NSDate date]}
+                                         ofItemAtPath:url.path error:nil];
+    }
+    return jpeg;
+}
+
+- (void)storeFrame:(NSData *)jpeg atPositionMs:(long long)positionMs {
+    if (jpeg.length == 0) return;
+    if (!_directoryReady.load()) {
+        if (![[NSFileManager defaultManager] createDirectoryAtURL:_directory
+                                      withIntermediateDirectories:YES attributes:nil error:nil]) {
+            return;
+        }
+        _directoryReady.store(true);
+    }
+    [jpeg writeToURL:[self frameUrlForPositionMs:positionMs] options:NSDataWritingAtomic error:nil];
+    if (_writesSincePrune.fetch_add(1) + 1 >= kSeekPreviewPruneEveryWrites) {
+        _writesSincePrune.store(0);
+        [SeekPreviewStore pruneAsync];
+    }
+}
+
+- (NSURL *)metaUrl {
+    return [_directory URLByAppendingPathComponent:@"meta.json"];
+}
+
+// Black-bar crop estimated for this title, as per-mille [left, top, right,
+// bottom]. Stored beside the frames, which stay uncropped.
+- (NSArray<NSNumber *> *)savedCrop {
+    NSData *data = [NSData dataWithContentsOfURL:[self metaUrl]];
+    if (data.length == 0) return nil;
+    NSDictionary *meta = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSArray *crop = [meta isKindOfClass:[NSDictionary class]] ? meta[@"crop"] : nil;
+    if (![crop isKindOfClass:[NSArray class]] || crop.count != 4) return nil;
+    for (id value in crop) {
+        if (![value isKindOfClass:[NSNumber class]]) return nil;
+    }
+    return crop;
+}
+
+- (void)saveCrop:(NSArray<NSNumber *> *)crop {
+    if (!_directoryReady.load()) {
+        if (![[NSFileManager defaultManager] createDirectoryAtURL:_directory
+                                      withIntermediateDirectories:YES attributes:nil error:nil]) {
+            return;
+        }
+        _directoryReady.store(true);
+    }
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"crop": crop ?: @[]} options:0 error:nil];
+    [data writeToURL:[self metaUrl] options:NSDataWritingAtomic error:nil];
+}
+
+// Drops files past the maximum age, then the least recently used files until
+// the cache is back under 90% of its budget, then directories left with no
+// frames. mtime is the recency signal; reads refresh it (see frameAtPositionMs).
++ (void)pruneNow {
+    NSURL *root = seekPreviewDiskRoot();
+    if (!root) return;
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSDirectoryEnumerator<NSURL *> *enumerator = [fileManager
+        enumeratorAtURL:root
+        includingPropertiesForKeys:@[NSURLIsDirectoryKey, NSURLContentModificationDateKey, NSURLFileSizeKey]
+        options:0 errorHandler:nil];
+    struct Entry { NSURL *url; NSTimeInterval modified; unsigned long long size; };
+    std::vector<Entry> files;
+    unsigned long long total = 0;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    for (NSURL *url in enumerator) {
+        NSNumber *isDirectory = nil;
+        NSDate *modified = nil;
+        NSNumber *size = nil;
+        [url getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
+        if (isDirectory.boolValue) continue;
+        [url getResourceValue:&modified forKey:NSURLContentModificationDateKey error:nil];
+        [url getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
+        NSTimeInterval age = modified ? now - modified.timeIntervalSinceReferenceDate : 0.0;
+        if (age > kSeekPreviewDiskMaxAge) {
+            [fileManager removeItemAtURL:url error:nil];
+            continue;
+        }
+        files.push_back({url, modified ? modified.timeIntervalSinceReferenceDate : now, size.unsignedLongLongValue});
+        total += size.unsignedLongLongValue;
+    }
+    if (total > kSeekPreviewDiskBudgetBytes) {
+        std::sort(files.begin(), files.end(), [](const Entry &a, const Entry &b) {
+            return a.modified < b.modified;
+        });
+        unsigned long long target = kSeekPreviewDiskBudgetBytes / 10 * 9;
+        for (const Entry &entry : files) {
+            if (total <= target) break;
+            if ([fileManager removeItemAtURL:entry.url error:nil]) total -= entry.size;
+        }
+    }
+    for (NSURL *directory in [fileManager contentsOfDirectoryAtURL:root includingPropertiesForKeys:nil
+                                                           options:NSDirectoryEnumerationSkipsHiddenFiles error:nil]) {
+        BOOL hasFrames = NO;
+        for (NSURL *entry in [fileManager contentsOfDirectoryAtURL:directory includingPropertiesForKeys:nil
+                                                           options:0 error:nil]) {
+            if ([entry.pathExtension isEqualToString:@"jpg"]) { hasFrames = YES; break; }
+        }
+        if (!hasFrames) [fileManager removeItemAtURL:directory error:nil];
+    }
+}
+
++ (void)pruneAsync {
+    static std::atomic_bool running(false);
+    if (running.exchange(true)) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool { [self pruneNow]; }
+        running.store(false);
+    });
+}
+@end
+
+// Letterbox detection on a captured frame, ported from the NuvioTV fork's
+// ThumbCrop: a row or column is a bar when its brightest pixel is under 40
+// luma and its mean under 22 (22 also catches 16/16/16 bars after a range
+// mismatch).
+static BOOL seekPreviewLineIsDark(const unsigned char *rgb, long long firstPixel, long long count, long long stepPixels) {
+    int maxLuma = 0;
+    long long sum = 0;
+    for (long long i = 0, pixel = firstPixel; i < count; i++, pixel += stepPixels) {
+        const unsigned char *p = rgb + pixel * 3;
+        int luma = (p[0] * 2 + p[1] * 5 + p[2]) / 8;
+        if (luma > maxLuma) maxLuma = luma;
+        sum += luma;
+    }
+    return maxLuma < 40 && sum < 22 * count;
+}
+
+// Bars in pixels, or NO when the frame is nearly all dark and says nothing.
+static BOOL seekPreviewMeasureBars(const unsigned char *rgb, int width, int height, int bars[4]) {
+    int top = 0;
+    while (top < height && seekPreviewLineIsDark(rgb, (long long)top * width, width, 1)) top++;
+    if (top >= height * 4 / 5) return NO;
+    int bottom = 0;
+    while (bottom < height - top &&
+           seekPreviewLineIsDark(rgb, (long long)(height - 1 - bottom) * width, width, 1)) bottom++;
+    int rows = height - top - bottom;
+    if (rows <= height / 5) return NO;
+    int left = 0;
+    while (left < width && seekPreviewLineIsDark(rgb, (long long)top * width + left, rows, width)) left++;
+    int right = 0;
+    while (right < width - left &&
+           seekPreviewLineIsDark(rgb, (long long)top * width + width - 1 - right, rows, width)) right++;
+    if (width - left - right <= width / 5) return NO;
+    bars[0] = left; bars[1] = top; bars[2] = right; bars[3] = bottom;
+    return YES;
+}
+
 // A separate, muted libmpv handle keeps preview seeks away from the playing handle.
 // It is created only after a seek-bar hover and released after inactivity.
 @interface SeekPreviewWorker : NSObject
 - (instancetype)initWithSource:(NSString *)source
                    headerLines:(NSArray<NSString *> *)headerLines
                         player:(MpvWebPlayer *)player;
+// Set once the content identity is known; frames are then read from and
+// written to the disk cache.
+@property (atomic, strong) SeekPreviewStore *store;
 - (void)requestPositionMs:(long long)positionMs warm:(BOOL)warm;
 - (void)shutdown;
 @end
@@ -1196,8 +1461,16 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
     NSArray<NSString *> *_headerLines;
     __weak MpvWebPlayer *_player;
     dispatch_queue_t _queue;
+    // Disk hits are answered here so they never wait behind a network capture on _queue.
+    dispatch_queue_t _ioQueue;
     mpv_handle *_mpv;
     BOOL _loaded;
+    // Black-bar samples from captured frames (per side, in pixels); guarded by self.
+    NSMutableArray<NSArray<NSNumber *> *> *_barSamples;
+    int _barFrameWidth;
+    int _barFrameHeight;
+    NSArray<NSNumber *> *_crop;
+    BOOL _cropDirty;
     // Failure bookkeeping lives on _queue. Consecutive failures stretch the
     // pause before the next network attempt; enough of them end previews for
     // the session so a struggling server is never kept busy.
@@ -1223,10 +1496,69 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
         _backoffUntil = [NSDate timeIntervalSinceReferenceDate] + kSeekPreviewHostStartPause;
     }
     _queue = dispatch_queue_create("com.nuvio.desktop.seek-preview", DISPATCH_QUEUE_SERIAL);
+    _ioQueue = dispatch_queue_create("com.nuvio.desktop.seek-preview-io", DISPATCH_QUEUE_SERIAL);
+    _barSamples = [NSMutableArray array];
     _stopped.store(false);
     _requestSerial.store(0);
     _latestPositionMs.store(0);
     return self;
+}
+
+- (void)setStore:(SeekPreviewStore *)store {
+    @synchronized (self) {
+        _store = store;
+        // The controls already received this crop with the cache index.
+        _crop = [store savedCrop];
+        _cropDirty = NO;
+    }
+}
+
+// Per title, the lower quartile of each side's measured bars: dark scenes
+// widen a bar and burnt-in subtitles narrow it, so single frames mislead.
+// Needs a handful of samples before it overrides the saved estimate.
+- (void)addBarSampleWidth:(int)width height:(int)height bars:(const int *)bars {
+    static const NSUInteger kMinSamples = 5;
+    static const NSUInteger kMaxSamples = 16;
+    @synchronized (self) {
+        if (_barFrameWidth != width || _barFrameHeight != height) {
+            [_barSamples removeAllObjects];
+            _barFrameWidth = width;
+            _barFrameHeight = height;
+        }
+        if (_barSamples.count >= kMaxSamples) return;
+        [_barSamples addObject:@[@(bars[0]), @(bars[1]), @(bars[2]), @(bars[3])]];
+        if (_barSamples.count < kMinSamples) return;
+        NSMutableArray<NSNumber *> *crop = [NSMutableArray arrayWithCapacity:4];
+        int dimensions[4] = {width, height, width, height};
+        for (int side = 0; side < 4; side++) {
+            NSMutableArray<NSNumber *> *values = [NSMutableArray arrayWithCapacity:_barSamples.count];
+            for (NSArray<NSNumber *> *sample in _barSamples) [values addObject:sample[side]];
+            [values sortUsingSelector:@selector(compare:)];
+            int quartile = values[values.count / 4].intValue;
+            int perMille = quartile * 1000 / MAX(dimensions[side], 1);
+            // Under 3% is not worth a visible crop.
+            crop[side] = @(perMille < 30 ? 0 : perMille);
+        }
+        BOOL empty = crop[0].intValue + crop[1].intValue + crop[2].intValue + crop[3].intValue == 0;
+        BOOL sane = crop[0].intValue + crop[2].intValue <= 600 && crop[1].intValue + crop[3].intValue <= 600;
+        NSArray<NSNumber *> *next = (empty || !sane) ? nil : [crop copy];
+        if ((next || _crop) && ![next isEqual:_crop]) {
+            _crop = next;
+            _cropDirty = YES;
+            [_store saveCrop:next];
+        }
+    }
+}
+
+// JSON for the controls when the crop changed since the last message
+// (nil: unchanged, "null": no bars), so steady-state results stay small.
+- (NSString *)takeCropJson {
+    @synchronized (self) {
+        if (!_cropDirty) return nil;
+        _cropDirty = NO;
+        if (!_crop) return @"null";
+        return [NSString stringWithFormat:@"[%@,%@,%@,%@]", _crop[0], _crop[1], _crop[2], _crop[3]];
+    }
 }
 
 - (void)destroyMpv {
@@ -1385,7 +1717,7 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
     return YES;
 }
 
-- (NSString *)captureAtPositionMs:(long long *)positionMs serial:(uint64_t)serial {
+- (NSData *)captureAtPositionMs:(long long *)positionMs serial:(uint64_t)serial {
     BOOL wasLoaded = _loaded;
     long long loadPositionMs = *positionMs;
     [self drainPendingEvents];
@@ -1412,7 +1744,7 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
     if (mpv_command_ret(_mpv, shot, &result) < 0) {
         return nil;
     }
-    NSString *imageUrl = nil;
+    NSData *jpeg = nil;
     if (result.format == MPV_FORMAT_NODE_MAP) {
         int64_t width = 0, height = 0, stride = 0;
         const char *format = NULL;
@@ -1445,24 +1777,59 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
                         out[x * 3 + 2] = row[x * 4];
                     }
                 }
-                NSData *jpeg = [bitmap representationUsingType:NSBitmapImageFileTypeJPEG
-                                                     properties:@{NSImageCompressionFactor: @0.72}];
-                if (jpeg.length > 0) {
-                    imageUrl = [@"data:image/jpeg;base64," stringByAppendingString:
-                        [jpeg base64EncodedStringWithOptions:0]];
+                // The stored frame stays whole; bars are measured here and applied
+                // at display time so the cache does not depend on the estimate.
+                int bars[4];
+                if (seekPreviewMeasureBars(destination, (int)width, (int)height, bars)) {
+                    [self addBarSampleWidth:(int)width height:(int)height bars:bars];
                 }
+                jpeg = [bitmap representationUsingType:NSBitmapImageFileTypeJPEG
+                                            properties:@{NSImageCompressionFactor: @0.72}];
             }
         }
     }
     mpv_free_node_contents(&result);
-    if (imageUrl) {
+    if (jpeg.length > 0) {
         _consecutiveFailures = 0;
         _lastHttpStatus = 0;
+        return jpeg;
     }
-    return imageUrl;
+    return nil;
 }
 
 - (void)requestPositionMs:(long long)positionMs warm:(BOOL)warm {
+    if (_stopped.load()) return;
+    SeekPreviewStore *store = self.store;
+    if (store && !warm) {
+        // Frames from an earlier session need no network, so they bypass the
+        // playback hold and the failure backoff entirely.
+        dispatch_async(_ioQueue, ^{
+            @autoreleasepool {
+                if (self->_stopped.load()) return;
+                NSData *cached = [store frameAtPositionMs:positionMs];
+                if (!cached) {
+                    [self enqueueNetworkRequestAtPositionMs:positionMs warm:NO];
+                    return;
+                }
+                NSString *imageUrl = seekPreviewDataUrl(cached);
+                NSString *cropJson = [self takeCropJson];
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    MpvWebPlayer *player = self->_player;
+                    if (player && !self->_stopped.load()) {
+                        [player handleSeekPreviewResultAtPositionMs:positionMs
+                                                           imageUrl:imageUrl
+                                                            retryMs:0
+                                                           cropJson:cropJson];
+                    }
+                });
+            }
+        });
+        return;
+    }
+    [self enqueueNetworkRequestAtPositionMs:positionMs warm:warm];
+}
+
+- (void)enqueueNetworkRequestAtPositionMs:(long long)positionMs warm:(BOOL)warm {
     if (_stopped.load()) return;
     _latestPositionMs.store(positionMs);
     uint64_t serial = _requestSerial.fetch_add(1) + 1;
@@ -1485,7 +1852,10 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
                     dispatch_async(dispatch_get_main_queue(), ^{
                         MpvWebPlayer *player = self->_player;
                         if (player && !self->_stopped.load()) {
-                            [player handleSeekPreviewResultAtPositionMs:positionMs imageUrl:nil retryMs:retryMs];
+                            [player handleSeekPreviewResultAtPositionMs:positionMs
+                                                               imageUrl:nil
+                                                                retryMs:retryMs
+                                                               cropJson:nil];
                         }
                     });
                 }
@@ -1494,15 +1864,20 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
             // A warm-up only needs the stream open; an open handle has nothing to do.
             if (!(warm && self->_loaded)) {
                 long long capturedPositionMs = positionMs;
-                NSString *imageUrl = [self captureAtPositionMs:&capturedPositionMs serial:serial];
+                NSData *jpeg = [self captureAtPositionMs:&capturedPositionMs serial:serial];
                 if (self->_stopped.load()) return;
+                SeekPreviewStore *store = self.store;
+                if (jpeg) [store storeFrame:jpeg atPositionMs:capturedPositionMs];
+                NSString *imageUrl = jpeg ? seekPreviewDataUrl(jpeg) : nil;
+                NSString *cropJson = [self takeCropJson];
                 long long remainingMs = imageUrl ? 0 : [self backoffRemainingMs];
                 dispatch_async(dispatch_get_main_queue(), ^{
                     MpvWebPlayer *player = self->_player;
                     if (player && !self->_stopped.load()) {
                         [player handleSeekPreviewResultAtPositionMs:capturedPositionMs
                                                            imageUrl:imageUrl
-                                                            retryMs:remainingMs];
+                                                            retryMs:remainingMs
+                                                           cropJson:cropJson];
                     }
                 });
             }
@@ -1580,6 +1955,12 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
     // Touched only on _mpvEventQueue, where syncControls samples the counters.
     std::vector<std::pair<NSTimeInterval, int64_t>> _previewDropEvents;
     int64_t _previewLastDropTotal;
+    // Persistent frame cache for this title; set once its identity is known.
+    SeekPreviewStore *_previewStore;
+    std::atomic_bool _previewStoreSettled;
+    int _previewStoreAttempts;
+    // Cached-frame index for the controls, resent if the page reloads.
+    NSString *_previewIndexScript;
 #endif
     BOOL _controlsSyncInFlight;
     NSRect _lastAppliedNativeLayoutBounds;
@@ -1639,6 +2020,7 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
 #if defined(__aarch64__)
     _previewHoldUntil.store(0.0);
     _previewLastDropTotal = -1;
+    _previewStoreSettled.store(false);
 #endif
     _mpvEventQueue = dispatch_queue_create("com.nuvio.desktop.mpv-events", DISPATCH_QUEUE_SERIAL);
     _mpvDrainQueue = dispatch_queue_create("com.nuvio.desktop.mpv-drain", DISPATCH_QUEUE_SERIAL);
@@ -2347,6 +2729,17 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
                                          position:position
                                       fullyCached:fullyCached
                                     networkStream:networkStream];
+            // The cache key needs the stream's byte length, which only exists
+            // once the demuxer has opened it.
+            BOOL previewStoreProbe = !self->_previewStoreSettled.load() && duration > 0.0;
+            long long previewFileSize = 0;
+            long long previewWidth = 0;
+            long long previewHeight = 0;
+            if (previewStoreProbe) {
+                previewFileSize = [self int64Property:"file-size" fallback:0];
+                previewWidth = [self int64Property:"video-params/w" fallback:0];
+                previewHeight = [self int64Property:"video-params/h" fallback:0];
+            }
 #endif
 
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -2354,6 +2747,14 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
                 if (!self->_webView || self->_mpv != mpv) {
                     return;
                 }
+#if defined(__aarch64__)
+                if (previewStoreProbe) {
+                    [self configurePreviewStoreFileSize:previewFileSize
+                                             durationMs:llround(duration * 1000.0)
+                                                  width:previewWidth
+                                                 height:previewHeight];
+                }
+#endif
                 [self applyHdrForPolledGamma:gamma primaries:primaries reason:@"sync" force:NO];
                 [self updateNowPlayingWithTitle:mediaTitle
                                        duration:duration
@@ -2434,6 +2835,49 @@ static BOOL seekPreviewHostIsRateLimited(NSString *host) {
         _previewDropEvents.clear();
     }
     _previewHoldUntil.store(holdUntil);
+}
+
+- (void)configurePreviewStoreFileSize:(long long)fileSize
+                           durationMs:(long long)durationMs
+                                width:(long long)width
+                               height:(long long)height {
+    if (_previewStoreSettled.load()) return;
+    NSString *key = [SeekPreviewStore keyForSource:_sourceUrl
+                                          fileSize:fileSize
+                                        durationMs:durationMs
+                                             width:width
+                                            height:height];
+    // Some streams never report a length; stop asking after about 20 s
+    // rather than probing forever, and run without a disk cache.
+    if (!key) {
+        if (++_previewStoreAttempts >= 40) _previewStoreSettled.store(true);
+        return;
+    }
+    SeekPreviewStore *store = [[SeekPreviewStore alloc] initWithKey:key];
+    _previewStoreSettled.store(true);
+    if (!store) return;
+    _previewStore = store;
+    _previewWorker.store = store;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @autoreleasepool {
+            [SeekPreviewStore pruneAsync];
+            NSArray<NSNumber *> *positions = [store cachedPositions];
+            NSArray<NSNumber *> *crop = [store savedCrop];
+            NSString *cropJson = crop
+                ? [NSString stringWithFormat:@"[%@,%@,%@,%@]", crop[0], crop[1], crop[2], crop[3]]
+                : @"null";
+            NSString *script = [NSString stringWithFormat:
+                @"window.playerSeekPreviewIndex({positions:[%@],crop:%@})",
+                [positions componentsJoinedByString:@","], cropJson];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (self->_previewStore != store) return;
+                self->_previewIndexScript = script;
+                if (self->_webView && self->_controlsWebReady) {
+                    [self->_webView evaluateJavaScript:script completionHandler:nil];
+                }
+            });
+        }
+    });
 }
 
 - (NSTimeInterval)previewPlaybackHoldRemaining {
@@ -3560,6 +4004,9 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
         _controlsWebReady = YES;
 #if defined(__aarch64__)
         [_webView evaluateJavaScript:@"window.enablePlayerSeekPreview()" completionHandler:nil];
+        if (_previewIndexScript) {
+            [_webView evaluateJavaScript:_previewIndexScript completionHandler:nil];
+        }
 #endif
         [self flushPendingControlsJsonIfReady];
         [self syncControls];
@@ -3575,11 +4022,12 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
                 _previewWorker = [[SeekPreviewWorker alloc] initWithSource:_sourceUrl
                                                                headerLines:_previewHeaderLines
                                                                     player:self];
+                _previewWorker.store = _previewStore;
             }
             [_previewWorker requestPositionMs:positionMs warm:previewWarm];
         } else if (!previewWarm) {
             // Answer explicitly so the controls can retry instead of waiting.
-            [self handleSeekPreviewResultAtPositionMs:positionMs imageUrl:nil retryMs:0];
+            [self handleSeekPreviewResultAtPositionMs:positionMs imageUrl:nil retryMs:0 cropJson:nil];
         }
         return;
     }
@@ -3636,15 +4084,17 @@ static int nuvioPlaybackFailureKindForMpvError(int error) {
 #if defined(__aarch64__)
 - (void)handleSeekPreviewResultAtPositionMs:(long long)positionMs
                                    imageUrl:(NSString *)imageUrl
-                                    retryMs:(long long)retryMs {
+                                    retryMs:(long long)retryMs
+                                   cropJson:(NSString *)cropJson {
     if (!_webView || !_controlsWebReady) return;
     NSString *encodedImage = imageUrl
         ? [NSString stringWithFormat:@"\"%@\"", imageUrl]
         : @"null";
     // retryMs: wait before asking again; negative ends previews for the session.
     NSString *script = [NSString stringWithFormat:
-        @"window.playerSeekPreview({positionMs:%lld,imageUrl:%@,retryMs:%lld})",
-        positionMs, encodedImage, retryMs];
+        @"window.playerSeekPreview({positionMs:%lld,imageUrl:%@,retryMs:%lld%@})",
+        positionMs, encodedImage, retryMs,
+        cropJson ? [@",crop:" stringByAppendingString:cropJson] : @""];
     [_webView evaluateJavaScript:script completionHandler:nil];
 }
 #endif

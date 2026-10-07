@@ -2,6 +2,7 @@ const root = document.getElementById("playerRoot");
 const seek = document.getElementById("seek");
 const seekPreview = document.getElementById("seekPreview");
 const seekPreviewImage = document.getElementById("seekPreviewImage");
+const seekPreviewFrame = document.getElementById("seekPreviewFrame");
 const seekPreviewTime = document.getElementById("seekPreviewTime");
 const positionLabel = document.getElementById("position");
 const durationLabel = document.getElementById("duration");
@@ -3210,6 +3211,12 @@ let seekPreviewEnabled = false;
 // Set when native gives up on previews for this session (repeated failures or
 // a rate-limited source); nothing more is requested from the stream then.
 let seekPreviewGivenUp = false;
+// Bucket positions (ms) whose frames are in the native disk cache. Reading
+// them needs no stream access, so they stay available even after native
+// pauses or gives up on the network.
+let seekPreviewDiskBuckets = new Set();
+// Black bars as per-mille [left, top, right, bottom], or null for none.
+let seekPreviewCrop = null;
 // Every span (ms) the player has reported as cached this session. Previews
 // are generated only inside these spans and stay available after the
 // playback cache evicts them.
@@ -3270,9 +3277,10 @@ const seekPreviewCachedSpanAt = positionMs =>
 // Buckets are clamped into the cached span so edge positions still map to a
 // frame the preview worker can read from cached data.
 const seekPreviewBucketFor = positionMs => {
+  const bucketMs = Math.round(positionMs / seekPreviewIntervalMs) * seekPreviewIntervalMs;
+  if (seekPreviewDiskBuckets.has(bucketMs)) return bucketMs;
   const span = seekPreviewCachedSpanAt(positionMs);
   if (!span) return null;
-  const bucketMs = Math.round(positionMs / seekPreviewIntervalMs) * seekPreviewIntervalMs;
   const lastFrameMs = Math.max(0, (Number(state.durationMs) || 0) - 500);
   const spanEndMs = Math.min(span[1], lastFrameMs);
   if (spanEndMs < span[0]) return null;
@@ -3291,10 +3299,41 @@ const seekPreviewImageFor = bucketMs => {
   return { image: "", exact: false };
 };
 
+// Crops the clipped frame to the active picture. The image is scaled so the
+// kept region fills the frame; the frame takes the region's aspect ratio.
+const layoutSeekPreviewCrop = () => {
+  const width = seekPreviewImage.naturalWidth;
+  const height = seekPreviewImage.naturalHeight;
+  const crop = seekPreviewCrop;
+  const keptW = crop ? 1 - (crop[0] + crop[2]) / 1000 : 1;
+  const keptH = crop ? 1 - (crop[1] + crop[3]) / 1000 : 1;
+  const aspect = width > 0 && height > 0 ? (keptW * width) / (keptH * height) : 0;
+  // A crop that would make the card very tall or wide is more likely a
+  // misdetection than a real picture shape.
+  if (!crop || !(aspect >= 1 && aspect <= 3)) {
+    seekPreviewFrame.style.aspectRatio = "";
+    seekPreviewImage.style.cssText = "";
+    return;
+  }
+  seekPreviewFrame.style.aspectRatio = String(aspect);
+  seekPreviewImage.style.cssText =
+    `object-fit:fill;inset:auto;width:${100 / keptW}%;height:${100 / keptH}%;` +
+    `left:${-(crop[0] / 1000) / keptW * 100}%;top:${-(crop[1] / 1000) / keptH * 100}%`;
+};
+
+const applySeekPreviewCrop = crop => {
+  seekPreviewCrop = Array.isArray(crop) && crop.length === 4 && crop.every(Number.isFinite)
+    ? crop.map(Number)
+    : null;
+  layoutSeekPreviewCrop();
+};
+
+seekPreviewImage.addEventListener("load", layoutSeekPreviewCrop);
+
 const applySeekPreviewImage = bucketMs => {
   const { image, exact } = seekPreviewImageFor(bucketMs);
   seekPreview.classList.toggle("has-image", Boolean(image));
-  seekPreviewImage.hidden = !image;
+  seekPreviewFrame.hidden = !image;
   if (image && image !== seekPreviewShownImage) seekPreviewImage.src = image;
   seekPreviewShownImage = image;
   return exact;
@@ -3312,7 +3351,7 @@ const positionSeekPreview = (rectWidth, x) => {
 const requestSeekPreview = () => {
   seekPreviewTimer = 0;
   const bucketMs = seekPreviewBucketMs;
-  if (seekPreviewGivenUp) return;
+  if (seekPreviewGivenUp && !seekPreviewDiskBuckets.has(bucketMs)) return;
   if (seekPreview.hidden || bucketMs === null || seekPreviewCache.has(bucketMs)) return;
   const elapsedMs = performance.now() - seekPreviewLastRequestAt;
   const delay = Math.max(
@@ -3357,6 +3396,8 @@ const scheduleSeekPreview = () => {
 window.enablePlayerSeekPreview = () => {
   seekPreviewEnabled = true;
   seekPreviewGivenUp = false;
+  seekPreviewDiskBuckets = new Set();
+  applySeekPreviewCrop(null);
   seekPreviewCache.clear();
   seekPreviewRetryAfter.clear();
   seekPreviewCachedSpans = [];
@@ -3365,8 +3406,20 @@ window.enablePlayerSeekPreview = () => {
 
 // retryMs is native's pacing answer when it could not produce a frame: how
 // long playback or a backoff asks us to wait, or negative to stop for good.
-window.playerSeekPreview = ({ positionMs, imageUrl, retryMs }) => {
+// Frames from earlier sessions of this title, indexed by native once the
+// stream's identity is known. Only positions travel; images are fetched on
+// demand through the normal request path.
+window.playerSeekPreviewIndex = ({ positions, crop }) => {
+  if (!seekPreviewEnabled) return;
+  seekPreviewDiskBuckets = new Set(Array.isArray(positions) ? positions : []);
+  applySeekPreviewCrop(crop);
+  // A hover that was outside cached data may be inside it now.
+  if (!seekPreview.hidden || isScrubbing) scheduleSeekFrame();
+};
+
+window.playerSeekPreview = ({ positionMs, imageUrl, retryMs, crop }) => {
   if (!seekPreviewEnabled || !Number.isFinite(positionMs)) return;
+  if (crop !== undefined) applySeekPreviewCrop(crop);
   if (retryMs < 0) seekPreviewGivenUp = true;
   if (imageUrl) {
     seekPreviewRetryAfter.delete(positionMs);
@@ -3419,7 +3472,7 @@ const showSeekPreview = (positionMs, rect) => {
   const exact = bucketMs === null ? true : applySeekPreviewImage(bucketMs);
   if (bucketMs === null) {
     seekPreview.classList.remove("has-image");
-    seekPreviewImage.hidden = true;
+    seekPreviewFrame.hidden = true;
     seekPreviewShownImage = "";
   }
   positionSeekPreview(

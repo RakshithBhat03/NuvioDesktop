@@ -1585,16 +1585,27 @@ button:disabled {
 }
 
 .seek-preview[hidden],
-.seek-preview img[hidden] {
+.seek-preview-frame[hidden] {
   display: none;
 }
 
-.seek-preview img {
-  display: block;
+/* The frame is stored whole; controls.js crops detected black bars here by
+   resizing and offsetting the image inside this clipped box. */
+.seek-preview-frame {
+  position: relative;
+  overflow: hidden;
   width: 100%;
   aspect-ratio: 16 / 9;
-  object-fit: contain;
   background: #08090c;
+}
+
+.seek-preview-frame img {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .seek-preview span {
