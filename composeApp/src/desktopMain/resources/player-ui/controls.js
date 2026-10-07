@@ -78,6 +78,7 @@ const nextEpisodeAction = document.getElementById("nextEpisodeAction");
 const sourcesButton = document.getElementById("sourcesButton");
 const episodesButton = document.getElementById("episodesButton");
 const cacheStatus = document.getElementById("cacheStatus");
+const statsHud = document.getElementById("statsHud");
 const cacheStatusIconUse = document.getElementById("cacheStatusIconUse");
 const cacheStatusSpeed = document.getElementById("cacheStatusSpeed");
 const cacheStatusSeparator = document.getElementById("cacheStatusSeparator");
@@ -838,6 +839,10 @@ const setProgress = (positionMs, durationMs) => {
     }
   }
   renderCacheStatus();
+  if (statsHudVisible && update.stats && typeof update.stats === "object") {
+    lastPlayerStats = update.stats;
+    renderStatsHud();
+  }
 };
 
 const formatTransferSpeed = bytesPerSecond => {
@@ -851,6 +856,22 @@ const formatTransferSpeed = bytesPerSecond => {
   return `${Math.round(value)} B/s`;
 };
 
+const formatByteSize = bytes => {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value >= 1e9) return `${(value / 1e9).toFixed(2)} GB`;
+  if (value >= 1e6) return `${(value / 1e6).toFixed(1)} MB`;
+  if (value >= 1e3) return `${Math.round(value / 1e3)} KB`;
+  return `${Math.round(value)} B`;
+};
+
+const formatBitrate = bitsPerSecond => {
+  const value = Number(bitsPerSecond);
+  if (!Number.isFinite(value) || value <= 0) return "";
+  if (value >= 1e6) return `${(value / 1e6).toFixed(2)} Mbps`;
+  return `${Math.round(value / 1e3)} kbps`;
+};
+
 const formatCachedDuration = seconds => {
   const total = Math.max(0, Math.round(Number(seconds) || 0));
   if (total < 60) return `${total}s`;
@@ -859,6 +880,117 @@ const formatCachedDuration = seconds => {
   const remainingSeconds = total % 60;
   if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
   return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+};
+
+// Stats HUD: native only reads and sends the extra mpv properties while it is
+// visible, so the panel is rebuilt solely from the latest `stats` payload.
+let statsHudVisible = false;
+let lastPlayerStats = null;
+
+const statsHudChannelLayout = count => ({ 1: "mono", 2: "stereo", 6: "5.1", 8: "7.1" }[count] || `${count} ch`);
+
+const statsHudGroups = stats => {
+  const has = value => value != null && value !== "" && !(typeof value === "number" && !Number.isFinite(value));
+  const num = (value, digits = 0, suffix = "") => has(value) ? `${Number(value).toFixed(digits)}${suffix}` : "";
+  const joinParts = (...parts) => parts.filter(Boolean).join(" · ");
+  const dims = (w, h) => has(w) && has(h) && w > 0 && h > 0 ? `${w}×${h}` : "";
+  const decoded = dims(stats.width, stats.height);
+  const display = dims(stats.displayWidth, stats.displayHeight);
+  const fps = joinParts(
+    has(stats.containerFps) ? `${Number(stats.containerFps).toFixed(3).replace(/\.?0+$/, "")} fps` : "",
+    has(stats.estimatedFps) ? `${Number(stats.estimatedFps).toFixed(1)} actual` : "",
+  );
+  const dropped = has(stats.droppedFrames) || has(stats.decoderDroppedFrames) || has(stats.delayedFrames)
+    ? [
+        `${stats.droppedFrames || 0} vo`,
+        `${stats.decoderDroppedFrames || 0} dec`,
+        `${stats.delayedFrames || 0} late`,
+      ].join(" / ")
+    : "";
+  const audioLayout = has(stats.audioChannels) && stats.audioChannels > 0 ? statsHudChannelLayout(stats.audioChannels) : "";
+  const cacheBytes = has(stats.cacheForwardBytes)
+    ? `${formatByteSize(stats.cacheForwardBytes)}${has(stats.cacheTotalBytes) ? ` / ${formatByteSize(stats.cacheTotalBytes)}` : ""}`
+    : "";
+  const avsync = has(stats.avsync) ? `${Number(stats.avsync) >= 0 ? "+" : ""}${(Number(stats.avsync) * 1000).toFixed(0)} ms` : "";
+  return [
+    ["Source", [
+      ["Container", stats.fileFormat],
+      ["Size", has(stats.fileSize) && stats.fileSize > 0 ? formatByteSize(stats.fileSize) : ""],
+    ]],
+    ["Video", [
+      ["Codec", joinParts(stats.videoCodec || stats.videoFormat, stats.hwdec && stats.hwdec !== "no" ? `hw ${stats.hwdec}` : stats.hwdec === "no" ? "software" : "")],
+      ["Resolution", decoded && display && decoded !== display ? `${decoded} → ${display}` : decoded || display],
+      ["Frame rate", fps],
+      ["Pixel format", joinParts(stats.pixelFormat, stats.hwPixelFormat && stats.hwPixelFormat !== stats.pixelFormat ? stats.hwPixelFormat : "")],
+      ["Color", joinParts(stats.primaries, stats.gamma, stats.colorMatrix)],
+      ["Peak", has(stats.sigPeak) && stats.sigPeak > 0 ? `${Number(stats.sigPeak).toFixed(2)}× SDR` : ""],
+      ["Bitrate", formatBitrate(stats.videoBitrate)],
+      ["Dropped", dropped],
+      ["A/V sync", avsync],
+    ]],
+    ["Audio", [
+      ["Codec", stats.audioCodec],
+      ["Channels", joinParts(audioLayout, has(stats.audioSampleRate) && stats.audioSampleRate > 0 ? `${num(stats.audioSampleRate / 1000, 1)} kHz` : "")],
+      ["Bitrate", formatBitrate(stats.audioBitrate)],
+      ["Output", stats.audioOutput],
+    ]],
+    ["Network", [
+      ["Input rate", formatTransferSpeed(stats.inputRate)],
+      ["Cache", has(stats.cacheDuration) ? formatCachedDuration(stats.cacheDuration) : ""],
+      ["Cache bytes", cacheBytes],
+    ]],
+    ["System", [
+      ["Memory", formatByteSize(stats.memoryBytes)],
+    ]],
+  ];
+};
+
+const renderStatsHud = () => {
+  if (!statsHud) return;
+  statsHud.hidden = !statsHudVisible;
+  statsHud.setAttribute("aria-hidden", statsHudVisible ? "false" : "true");
+  if (!statsHudVisible) {
+    statsHud.replaceChildren();
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  const title = document.createElement("div");
+  title.className = "stats-hud-title";
+  title.textContent = "Stats for nerds";
+  fragment.append(title);
+  if (lastPlayerStats) {
+    for (const [heading, rows] of statsHudGroups(lastPlayerStats)) {
+      const visibleRows = rows.filter(([, value]) => value != null && value !== "");
+      if (!visibleRows.length) continue;
+      const group = document.createElement("div");
+      group.className = "stats-hud-group";
+      const headingEl = document.createElement("div");
+      headingEl.className = "stats-hud-heading";
+      headingEl.textContent = heading;
+      group.append(headingEl);
+      for (const [label, value] of visibleRows) {
+        const row = document.createElement("div");
+        row.className = "stats-hud-row";
+        const labelEl = document.createElement("span");
+        labelEl.className = "stats-hud-label";
+        labelEl.textContent = label;
+        const valueEl = document.createElement("span");
+        valueEl.className = "stats-hud-value";
+        valueEl.textContent = String(value);
+        row.append(labelEl, valueEl);
+        group.append(row);
+      }
+      fragment.append(group);
+    }
+  }
+  statsHud.replaceChildren(fragment);
+};
+
+const toggleStatsHud = () => {
+  statsHudVisible = !statsHudVisible;
+  if (!statsHudVisible) lastPlayerStats = null;
+  renderStatsHud();
+  send("statsHud", statsHudVisible ? 1 : 0);
 };
 
 // Live transfer and cache state for the stream, shown beside the source button.
@@ -4253,6 +4385,11 @@ document.addEventListener("keydown", event => {
     return;
   }
 
+  if (event.code === "KeyD") {
+    event.preventDefault();
+    toggleStatsHud();
+    return;
+  }
   if (event.code === "KeyA") {
     event.preventDefault();
     if (activeModal === "audio") closePlayerModal(true);
